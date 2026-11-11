@@ -4,20 +4,26 @@ import type { EventSource } from "../kernel/types.ts";
 
 export function kernelClient(base: string, source: EventSource): KernelClient & { get<T>(path: string): Promise<T> } {
   let n = 0;
-  const get = async <T>(path: string): Promise<T> => (await fetch(base + path)).json() as Promise<T>;
-  const post = async <T>(path: string, body: unknown): Promise<T> =>
-    (await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json() as Promise<T>;
+  const sourceId = () => `${process.pid}-${Date.now()}-${n++}`;
+  const get = async <T>(path: string): Promise<T> => {
+    const res = await fetch(base + path);
+    const data = await res.json();
+    if (!res.ok) throw new Error(`GET ${path} → ${res.status} ${(data as { error?: string }).error ?? ""}`);
+    return data as T;
+  };
+  const post = async <T>(path: string, body: unknown): Promise<T> => {
+    const res = await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`POST ${path} → ${res.status} ${(data as { error?: string }).error ?? ""}`);
+    return data as T;
+  };
   return {
     get,
-    claim: (agent) => post("/runs/claim", { agent }),
+    claim: (agent) => post("/runs/claim", { agent, at: new Date().toISOString(), source_id: sourceId() }),
     emit: async (type, payload, about) => {
-      await post("/events", { source, source_id: `${process.pid}-${Date.now()}-${n++}`, type, at: new Date().toISOString(), about, payload });
+      await post("/events", { source, source_id: sourceId(), type, at: new Date().toISOString(), about, payload });
     },
-    goal: async (id) => {
-      const o = await get<{ goals: { id: string }[] }>("/overview");
-      const g = o.goals.find((x) => x.id === id);
-      if (!g) throw new Error(`目标不存在 ${id}`);
-      return g as never; // TODO P1-05：补 GET /goals/:id
-    },
+    goal: (id) => get(`/goals/${encodeURIComponent(id)}`),
+    runStatus: async (id) => (await get<{ status: string }>(`/runs/${encodeURIComponent(id)}`)).status,
   };
 }

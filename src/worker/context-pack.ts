@@ -29,3 +29,14 @@ export function buildPrompt(p: PackInput): string {
   parts.push(RECEIPT_INSTRUCTIONS);
   return parts.join("\n\n");
 }
+
+// 接上原会话时的提示词：会话里已经有契约和前文，只补这次新到的东西（人的回答、退回意见、恢复说明）。
+export function buildResumePrompt(p: { task: Task; feedback?: string | undefined; recovery?: string | undefined }): string {
+  const parts = [`# 接着做任务 ${p.task.id}`];
+  if (p.feedback) parts.push(`## 新到的反馈\n${p.feedback}`);
+  if (p.recovery) parts.push(`## 恢复说明\n${p.recovery}`);
+  if (!p.feedback && !p.recovery) parts.push("上一轮结束后没有新的输入。检查工作目录和 git 状态，从停下的地方接着做。");
+  parts.push("按上面的反馈继续，不要重复问已经回答过的问题。做完后交回执。");
+  parts.push(RECEIPT_INSTRUCTIONS);
+  return parts.join("\n\n");
+}

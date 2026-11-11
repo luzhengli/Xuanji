@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS timers (
   id INTEGER PRIMARY KEY AUTOINCREMENT, about TEXT NOT NULL, due_at TEXT NOT NULL, reason TEXT NOT NULL,
   fired INTEGER NOT NULL DEFAULT 0
 );
+-- 引用图最小版（P1-18）：归并时把每条事件涉及和签发的编号记下来，xj why 从任一编号找回全部事件。
+CREATE TABLE IF NOT EXISTS event_refs (
+  ref TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (ref, seq)
+);
 CREATE TABLE IF NOT EXISTS quota (
   agent TEXT PRIMARY KEY, seven_day_utilization REAL, seven_day_resets_at TEXT,
   five_hour_utilization REAL, five_hour_resets_at TEXT, observed_at TEXT
@@ -65,10 +69,20 @@ CREATE TABLE IF NOT EXISTS quota (
 
 export type DB = DatabaseSync;
 
+// 只加列不改列：旧账本打开时补上后来新增的列。
+const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
+  ["tasks", "feedback", "TEXT"],                          // 下一轮要带上的人的回答或退回意见
+  ["tasks", "failures", "INTEGER NOT NULL DEFAULT 0"],    // 连续 failed 的次数，用于退避和转受阻
+];
+
 export function openStore(path: string): DB {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  for (const [table, column, decl] of ADDED_COLUMNS) {
+    const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+    if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
   return db;
 }
 
@@ -86,7 +100,7 @@ export function nextId(db: DB, name: string): number {
 
 // 投影可以从事件日志重建：清空所有投影表，不动 events。
 export function clearProjections(db: DB): void {
-  for (const t of ["leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
+  for (const t of ["event_refs", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
     db.exec(`DELETE FROM ${t}`);
   }
 }

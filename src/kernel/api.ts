@@ -15,12 +15,20 @@ export function startApi(kernel: Kernel, port: number) {
         const e = kernel.ingest(body as EventInput);
         return json(res, 200, { seq: e?.seq ?? null, duplicate: e === null });
       }
-      if (route === "POST /runs/claim") {            // 接单程序领活
-        const a = kernel.claim((body as { agent: string }).agent);
+      if (route === "POST /runs/claim") {            // 接单程序领活；轮次编号由内核签发并返回
+        const b = body as { agent: string; at: string; source_id: string };
+        if (!b.agent || !b.at || !b.source_id) return json(res, 400, { error: "领活要带 agent、at、source_id" });
+        const a = kernel.claim(b.agent, b.at, b.source_id);
         return json(res, 200, a ?? { task: null });
       }
       if (route === "GET /cards") return json(res, 200, kernel.cards());
       if (route === "GET /overview") return json(res, 200, kernel.overview());
+      const one = /^GET \/(goals|tasks|runs)\/([^/]+)$/.exec(route);
+      if (one) {
+        const id = decodeURIComponent(one[2]!);
+        const found = one[1] === "goals" ? kernel.goal(id) : one[1] === "tasks" ? kernel.task(id) : kernel.run(id);
+        return found ? json(res, 200, found) : json(res, 404, { error: `不存在 ${id}` });
+      }
       if (url.pathname.startsWith("/why/")) return json(res, 200, kernel.why(decodeURIComponent(url.pathname.slice(5))));
       if (url.pathname.startsWith("/recall/")) return json(res, 501, { error: "TODO P2 链式召回" });
       if (route === "GET /health") return json(res, 200, { ok: true });

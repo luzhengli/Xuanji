@@ -1,32 +1,34 @@
 # 当前状态
 
-更新于 2026-11-11（晚，S1 通过）。每次收工时整份改写，不要追加。
+更新于 2026-11-12（凌晨，一期闭环经 `xj` 真实跑通）。每次收工时整份改写，不要追加。
 
 ## 现在在哪
 
-三项开工前实测全部通过。一期代码框架已在 `main`（`5e1b86d`），飞书点击解析、原地更新和录制测试已随后提交。`npm test` 11 个通过，`npm run typecheck` 通过。各进程仍是骨架，尚未跑通真实的一轮。
+一期出口标准“一件事从提出到验收，人不打开任何 Agent 会话”已经经 `xj` 真实跑通，已按人的确认提交到本地 `main`。`npm test` 24 个通过，`npm run typecheck` 通过。
 
-- 前次实测确认这台机器就是 Mac mini（`hw.model` = Mac16,10，Node v24.19.0，Claude Code 2.1.322，lark-cli 1.0.100，Codex 0.167.0）；本次复核 Node 为 v24.19.0。
-- **S2 通过**：前次以 `claude -p --output-format stream-json --verbose` 取到 `result.result` 和 `session_id`，并成功 `--resume <id>`；录制输出在 `test/fixtures/`，本次解析测试通过。
-- **S3 已验证**：前次实测无界面时状态栏脚本不会被调用，改从 `rate_limit_event` 读取周用量和重置时间；设计文档已同步，本次解析测试通过。
-- **S1 通过**：你在开发者后台订阅 `card.action.trigger` 后，点击经 lark-cli 长连接收到（`operator_id`、`message_id`、`action_value` 是 JSON 字符串、30 分钟 token），并用 token 调 `/open-apis/interactive/v1/card/update` 把探针卡原地改成了结论。事件录在 `test/fixtures/feishu-card-click.json`，`parseCardClick` 有测试。
-- **代码范围**：`src/kernel`、`src/worker`、`src/channels`、定时器来源、三个 launchd plist、备份脚本。前次手工跑通 `xj goal` 立项与重启重建账本；本次仅运行离线测试及类型检查。
+- **真实一轮（2026-11-12）**：`npm run kernel` + `npm run worker`（`XJ_WORK_ROOT=/tmp/xj-real/work`，模型 `claude-haiku-5-5`）。
+  - T-1：`xj goal` → RN-1 无界面执行，交 `done` → 审核卡 C-1 → `xj answer C-1 accept` → T-1、G-1 都是 `done`。`xj why T-1` 列出立项、领活、回执、验收四条事件。
+  - T-2（问人路径）：RN-2 交 `ask` → 决策卡 C-3 → `xj answer C-3 中文 …` → RN-3 以 `--resume` 接上同一会话（两轮 `session_id` 都是 `9b5d5284-…`），按回答实现 → C-4 接受 → done。
+  - 周用量读数 52%（上限 60%）。账本在 `data/xuanji.db`（不入库），沙盒仓库在 `/tmp/xj-real/work`。
+- **这次补的**：领活时由内核签发 `run_id`（`/runs/claim` 一个事务挑任务并落 `run.claimed`）；`GET /goals|tasks|runs/:id`；`waiting` 的相对时长换算成 `due_at`，`timer.tick` 到点放回队列；`failed` 退避 1 分钟、5 分钟，连续第 3 次转受阻；P1-18 关联表 `event_refs`；心跳与叫停（结束进程组）；续接提示词带人的回答；限流最小版；`xj` 可读输出。
+- **测试**：`test/loop.test.ts` 起真的本机接口和真的 `xj` 子进程，用回放适配器喂真实一轮录下的 `test/fixtures/real-*.ndjson`，覆盖验收 1–3、叫停、适配器出错、回执重写；`test/followup.test.ts` 覆盖 waiting、failed 退避、退回反馈、限流、重复领活。
 
 ## 下一步
 
-1. 修复接单骨架中 `run_id` 和目标查询的 TODO，再串起内核、worker 和 `xj goal` 跑真实一轮，核对回执入账与审核卡生成。
-2. 继续完成 P1-05 到 P1-09 的接单、适配、回执、挂起续接与卡片功能。
+1. P1-14 重启恢复 + P1-19 看门狗：心跳已入账但没有规则读它；内核重启后“执行中”的轮次还不会被发现。
+2. 飞书真实一轮（P1-09/P1-11 的文字框、适用范围、原地更新取账本正文），然后 P1-10 主理人、P1-13 预算。
 
 ## 卡在哪
 
-- Codex 订阅额度已用尽，11 月 14 日恢复；在那之前 GUI 操作做不了（约定不许用别的工具代替）。
-- `xj why <编号>` 查不到立项事件；归并签发编号后尚未建立事件关联表，已记录为 P1-18。
+- Codex 订阅额度已用尽，11 月 14 日恢复；在那之前 GUI 操作做不了。
 - 尚未配置 Git 远端，提交只在本地。
 
 ## 接手须知
 
-- Node 24 直接跑 `.ts`，strip-only 模式不能用构造器参数属性、enum、namespace；`erasableSyntaxOnly` 会在类型检查时拦住。
-- 内核只听 `127.0.0.1:7331`，来源、接单程序、通道通过 HTTP 访问；事件 `source_id` 由客户端生成以去重。
-- 真实配置使用 `xuanji.config.json`，已加入忽略规则；样例 `xuanji.config.example.json` 入库。本人 `owner_open_id` 沿用前次记录的 `ou_00000000000000000000000000000001`。
-- 迟到回执只记轮次、不改任务状态、不出卡，相关取舍见 `docs/DECISIONS.md`。
-- `.firecrawl/` 只读且不入库；设计文档三张图的源在在线文档中。
+- Node 24 直接跑 `.ts`，strip-only 模式不能用构造器参数属性、enum、namespace。
+- 内核只听 `127.0.0.1:7331`；领活要带 `agent`、`at`、`source_id`，返回 `run_id`、`feedback`、`previous`。接单程序不再自己发 `run.claimed`。
+- 接单程序的环境变量：`XJ_WORK_ROOT` 工作目录，`XJ_RECORD_DIR` 录下每轮原始 stream-json（用来做新的录制用例）。内核的 `XJ_TICK_MS` 调定时器间隔。
+- 本机配置 `xuanji.config.json` 不入库，`claude` 档案写了 `model: claude-haiku-5-5`、`capacity: 1`；权限模式没写，沿用本机 Claude Code 的 `auto`。
+- 一期所有任务共用一个工作目录（二期才每任务一个 worktree）。真实一轮里 Agent 在沙盒仓库自建了分支 `feat/greet`，说明共用目录时任务会互相影响。
+- 内核启动时对账本跑 `rebuild()` 是人认可的行为（2026-11-12 定），不需要先问；事件表仍然只追加。
+- 迟到回执（轮次已不在 running）只记在轮次上；被叫停的轮次不交回执。取舍见 `docs/DECISIONS.md` 2026-11-12 一节。

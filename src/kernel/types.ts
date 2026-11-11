@@ -69,6 +69,8 @@ export interface Task {
   minutes_used: number;
   session_id: string | null;     // 挂起后接上原会话用
   workdir: string | null;
+  feedback: string | null;       // 下一轮要带上的人的回答或退回意见；回执到达时清空
+  failures: number;              // 连续 failed 的次数
   created_at: string;
   updated_at: string;
 }

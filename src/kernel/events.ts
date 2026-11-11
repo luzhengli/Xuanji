@@ -15,8 +15,10 @@ export function readEvents(db: DB, fromSeq = 0): Event[] {
   return (db.prepare("SELECT * FROM events WHERE seq > ? ORDER BY seq").all(fromSeq) as Record<string, unknown>[]).map(rowToEvent);
 }
 
+// 一个编号的全部事件：事件自己标的 about，加上归并时回写到关联表里的（含签发该编号的那条）。
 export function eventsAbout(db: DB, ref: string): Event[] {
-  return (db.prepare("SELECT * FROM events WHERE about = ? OR payload LIKE ? ORDER BY seq").all(ref, `%"${ref}"%`) as Record<string, unknown>[]).map(rowToEvent);
+  return (db.prepare("SELECT * FROM events WHERE about = ? OR seq IN (SELECT seq FROM event_refs WHERE ref = ?) ORDER BY seq")
+    .all(ref, ref) as Record<string, unknown>[]).map(rowToEvent);
 }
 
 function rowToEvent(r: Record<string, unknown>): Event {

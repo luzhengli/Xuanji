@@ -11,7 +11,8 @@ export interface AgentProfile {
   tier: "strong" | "light";
   billing: Billing;
   capacity: number;
-  model?: string;
+  model?: string;             // 例：claude-haiku-5-5；不写用 Agent 自己的默认
+  permission_mode?: string;   // 无界面运行时的权限模式；不写沿用本机 Agent 的设置
   daily_usd?: number;
 }
 

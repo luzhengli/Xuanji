@@ -17,12 +17,13 @@ test("事件去重：同一来源同一编号只记一次", () => {
 test("一件事走完：立项 → 领活 → 回执 done → 审核卡 → 接受 → 完成", () => {
   const k = mk();
   k.ingest({ source: "cli", source_id: "g", type: "goal.confirmed", at, payload: { title: "结算页支持优惠码" } });
-  const t = k.overview().tasks[0] as { id: string; state: string };
+  const t = k.overview().tasks[0]!;
   assert.equal(t.state, "queued"); assert.equal(waitingOn("queued"), "agent");
 
-  const a = k.claim("claude"); assert.equal(a?.task.id, t.id);
-  k.ingest({ source: "worker", source_id: "c", type: "run.claimed", at, about: t.id, payload: { task_id: t.id, agent: "claude", purpose: "execute" } });
-  assert.equal(k.claim("claude")?.task ?? null, null, "没有第二件可领的活");
+  const a = k.claim("claude", at, "c"); assert.equal(a?.task.id, t.id);
+  assert.equal(a?.run_id, "RN-1", "轮次编号由内核在领活时签发");
+  assert.equal(a?.task.state, "running");
+  assert.equal(k.claim("claude", at, "c2"), null, "没有第二件可领的活");
 
   k.ingest({ source: "worker", source_id: "r", type: "run.receipt", at, about: t.id,
     payload: { run_id: "RN-1", task_id: t.id, session_id: "sess-1", receipt: { outcome: "done", summary: "好了", handoff: "见 coupon.ts" } } });
@@ -70,5 +71,5 @@ test("背压：待处理决策卡+审核卡达到上限时不再派活", () => {
   k.ingest({ source: "cli", source_id: "g2", type: "goal.confirmed", at, payload: { title: "b" } });
   k.ingest({ source: "worker", source_id: "c", type: "run.claimed", at, payload: { task_id: "T-1", agent: "claude", purpose: "execute" } });
   k.ingest({ source: "worker", source_id: "r", type: "run.receipt", at, payload: { run_id: "RN-1", task_id: "T-1", receipt: { outcome: "done", summary: "s", handoff: "h" } } });
-  assert.equal(k.claim("claude"), null);
+  assert.equal(k.claim("claude", at, "c2"), null);
 });

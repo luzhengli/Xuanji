@@ -4,31 +4,51 @@
 // result.session_id 可用于 --resume；rate_limit_event.rate_limit_info.unifiedWindows 给周用量和重置时间。
 // 状态栏脚本在无界面模式下不会被调用，所以用量读数来自这里，不来自状态栏文件。
 import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentAdapter, RunRequest, RunResult, RateLimitWindow } from "./types.ts";
+
+export interface ClaudeCodeOptions {
+  bin?: string;
+  recordDir?: string | undefined;   // 设了就把每轮原始的 stream-json 存下来，作测试用的录制输出
+}
+
+export function buildArgs(req: RunRequest): string[] {
+  const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  if (req.session_id) args.push("--resume", req.session_id);
+  if (req.model) args.push("--model", req.model);
+  if (req.tools) args.push("--tools", req.tools.join(","));
+  if (req.permission_mode) args.push("--permission-mode", req.permission_mode);
+  args.push(req.prompt);
+  return args;
+}
 
 export class ClaudeCodeAdapter implements AgentAdapter {
   readonly name = "claude";
   private readonly bin: string;
-  constructor(bin = "claude") { this.bin = bin; }
+  private readonly recordDir: string | undefined;
+  constructor(opts: ClaudeCodeOptions = {}) { this.bin = opts.bin ?? "claude"; this.recordDir = opts.recordDir; }
 
   run(req: RunRequest, signal?: AbortSignal): Promise<RunResult> {
-    const args = ["-p", "--output-format", "stream-json", "--verbose"];
-    if (req.session_id) args.push("--resume", req.session_id);
-    if (req.model) args.push("--model", req.model);
-    if (req.tools) args.push("--tools", req.tools.join(","));
-    if (req.permission_mode) args.push("--permission-mode", req.permission_mode);
-    args.push(req.prompt);
-
+    const args = buildArgs(req);
     return new Promise((resolve, reject) => {
-      const child = spawn(this.bin, args, { cwd: req.cwd, stdio: ["ignore", "pipe", "pipe"], signal: signal as AbortSignal });
-      let out = "", err = "";
-      const timer = setTimeout(() => child.kill("SIGTERM"), req.timeout_ms);
+      // 自成一个进程组：停止时连同 Agent 起的子进程一起结束。
+      const child = spawn(this.bin, args, { cwd: req.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      let out = "", err = "", stopped = false;
+      const kill = () => { stopped = true; try { process.kill(-child.pid!, "SIGTERM"); } catch { child.kill("SIGTERM"); } };
+      const timer = setTimeout(kill, req.timeout_ms);
+      signal?.addEventListener("abort", kill, { once: true });
       child.stdout.on("data", (c) => (out += c));
       child.stderr.on("data", (c) => (err += c));
       child.on("error", (e) => { clearTimeout(timer); reject(e); });
       child.on("close", (code) => {
         clearTimeout(timer);
-        resolve({ ...parseStream(out), exit_code: code ?? -1, stderr: err });
+        signal?.removeEventListener("abort", kill);
+        if (this.recordDir) {
+          mkdirSync(this.recordDir, { recursive: true });
+          writeFileSync(join(this.recordDir, `${req.label ?? Date.now()}.ndjson`), out);
+        }
+        resolve({ ...parseStream(out), exit_code: code ?? -1, stderr: err, stopped });
       });
     });
   }
