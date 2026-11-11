@@ -15,7 +15,7 @@ export interface EventInput {
   payload: Record<string, unknown>;
 }
 
-export interface Event extends EventInput { seq: number; }
+export interface Event extends EventInput { seq: number; note?: string | undefined; }  // note 只在 why 查询时带上
 
 // ---- 目标 ----
 export type AutonomyLevel = "L0" | "L1" | "L2" | "L3";
@@ -70,7 +70,8 @@ export interface Task {
   session_id: string | null;     // 挂起后接上原会话用
   workdir: string | null;
   feedback: string | null;       // 下一轮要带上的人的回答或退回意见；回执到达时清空
-  failures: number;              // 连续 failed 的次数
+  failures: number;              // 连续 failed 或中断的次数
+  recovery: string | null;       // 上一轮中断后的恢复说明；回执到达时清空
   created_at: string;
   updated_at: string;
 }
@@ -89,6 +90,9 @@ export interface Run {
   heartbeat_at: string | null;
   finished_at: string | null;
   receipt: Receipt | null;
+  worker: string | null;         // 领活的接单程序名与实例
+  instance: string | null;
+  lost_reason: string | null;    // 中断原因：心跳超时、单轮超时、接单程序重启
 }
 
 // ---- 回执 ----

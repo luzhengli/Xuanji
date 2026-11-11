@@ -16,9 +16,11 @@ export function readEvents(db: DB, fromSeq = 0): Event[] {
 }
 
 // 一个编号的全部事件：事件自己标的 about，加上归并时回写到关联表里的（含签发该编号的那条）。
+// 带上归并留下的说明（note），例如看门狗在哪次 tick 判了哪一轮中断。
 export function eventsAbout(db: DB, ref: string): Event[] {
-  return (db.prepare("SELECT * FROM events WHERE about = ? OR seq IN (SELECT seq FROM event_refs WHERE ref = ?) ORDER BY seq")
-    .all(ref, ref) as Record<string, unknown>[]).map(rowToEvent);
+  return (db.prepare(`SELECT e.*, x.note FROM events e LEFT JOIN event_refs x ON x.seq = e.seq AND x.ref = ?
+      WHERE e.about = ? OR x.seq IS NOT NULL ORDER BY e.seq`)
+    .all(ref, ref) as Record<string, unknown>[]).map((r) => ({ ...rowToEvent(r), ...(r.note ? { note: r.note as string } : {}) }));
 }
 
 function rowToEvent(r: Record<string, unknown>): Event {

@@ -72,7 +72,12 @@ export type DB = DatabaseSync;
 // 只加列不改列：旧账本打开时补上后来新增的列。
 const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["tasks", "feedback", "TEXT"],                          // 下一轮要带上的人的回答或退回意见
-  ["tasks", "failures", "INTEGER NOT NULL DEFAULT 0"],    // 连续 failed 的次数，用于退避和转受阻
+  ["tasks", "failures", "INTEGER NOT NULL DEFAULT 0"],    // 连续 failed 或中断的次数，用于退避和转受阻
+  ["tasks", "recovery", "TEXT"],                          // 上一轮中断后的恢复说明（P1-14）；回执到达时清空
+  ["runs", "worker", "TEXT"],                             // 领活的接单程序名
+  ["runs", "instance", "TEXT"],                           // 领活的接单程序实例；它重启后，旧实例的轮次即中断
+  ["runs", "lost_reason", "TEXT"],
+  ["event_refs", "note", "TEXT"],                         // 归并对这个编号做了什么（看门狗判中断等），给 xj why 看
 ];
 
 export function openStore(path: string): DB {

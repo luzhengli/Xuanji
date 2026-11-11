@@ -1,22 +1,24 @@
 # 当前状态
 
-更新于 2026-11-12（凌晨，一期闭环经 `xj` 真实跑通）。每次收工时整份改写，不要追加。
+更新于 2026-11-12（重启恢复与看门狗做完）。每次收工时整份改写，不要追加。
 
 ## 现在在哪
 
-一期出口标准“一件事从提出到验收，人不打开任何 Agent 会话”已经经 `xj` 真实跑通，已按人的确认提交到本地 `main`。`npm test` 24 个通过，`npm run typecheck` 通过。
+一期闭环经 `xj` 真实跑通（`5548993`）。这次又做了 P1-14 重启恢复和 P1-19 看门狗，三场真实演练都通过，已按人的确认提交到本地 `main`。`npm test` 39 个通过，`npm run typecheck` 通过。
 
-- **真实一轮（2026-11-12）**：`npm run kernel` + `npm run worker`（`XJ_WORK_ROOT=/tmp/xj-real/work`，模型 `claude-haiku-5-5`）。
-  - T-1：`xj goal` → RN-1 无界面执行，交 `done` → 审核卡 C-1 → `xj answer C-1 accept` → T-1、G-1 都是 `done`。`xj why T-1` 列出立项、领活、回执、验收四条事件。
-  - T-2（问人路径）：RN-2 交 `ask` → 决策卡 C-3 → `xj answer C-3 中文 …` → RN-3 以 `--resume` 接上同一会话（两轮 `session_id` 都是 `9b5d5284-…`），按回答实现 → C-4 接受 → done。
-  - 周用量读数 52%（上限 60%）。账本在 `data/xuanji.db`（不入库），沙盒仓库在 `/tmp/xj-real/work`。
-- **这次补的**：领活时由内核签发 `run_id`（`/runs/claim` 一个事务挑任务并落 `run.claimed`）；`GET /goals|tasks|runs/:id`；`waiting` 的相对时长换算成 `due_at`，`timer.tick` 到点放回队列；`failed` 退避 1 分钟、5 分钟，连续第 3 次转受阻；P1-18 关联表 `event_refs`；心跳与叫停（结束进程组）；续接提示词带人的回答；限流最小版；`xj` 可读输出。
-- **测试**：`test/loop.test.ts` 起真的本机接口和真的 `xj` 子进程，用回放适配器喂真实一轮录下的 `test/fixtures/real-*.ndjson`，覆盖验收 1–3、叫停、适配器出错、回执重写；`test/followup.test.ts` 覆盖 waiting、failed 退避、退回反馈、限流、重复领活。
+- **重启恢复（P1-14）**：内核启动先重建投影，再记 `kernel.restarted`，只给执行中的轮次心跳宽限，不判中断。接单程序启动先结束上个实例留下的 Agent 进程组，再报到 `worker.started`，同名旧实例的轮次立即判 `lost`。中断的轮次带恢复说明回队列，能接上原会话就接上。回执等事件连不上内核时用同一来源编号重试。
+- **看门狗（P1-19）**：每次 `timer.tick` 检查心跳超时（3 分钟）和单轮超时（预算加 5 分钟）。中断与 `failed` 共用连续失败计数，第 3 次转受阻出卡片。判了什么写进 `event_refs.note`，`xj why` 能看到。机器睡眠醒来时，定时器来源先补 `timer.resumed` 给宽限。
+- **真实演练（haiku，沙盒 `/tmp/xj-real/work`，周用量 52% → 54%）**：
+  - `kill -9` 接单程序：孤儿 Claude Code 进程被清理，RN-4 判中断，RN-5 接上原会话、读到恢复说明后补完，`mul` 只提交一次（T-3）。
+  - 内核停机约 30 秒：RN-6 没被误判，回执在内核起来后照常入账（T-4）。
+  - `SIGSTOP` 冻住接单程序：3 分钟后看门狗按时判 RN-7 中断；重派的 RN-8 核对后没有重做（T-5）。
+- **演练中修掉的真实缺陷**：回执重写时 `--tools` 吞掉提示词（这条路径原本在真实环境里是坏的）；管道写满时 `result` 行被截断，改用最后一条 assistant 文本；作废的轮次不再重写和交回执；会话编号一拿到就上报。
 
 ## 下一步
 
-1. P1-14 重启恢复 + P1-19 看门狗：心跳已入账但没有规则读它；内核重启后“执行中”的轮次还不会被发现。
-2. 飞书真实一轮（P1-09/P1-11 的文字框、适用范围、原地更新取账本正文），然后 P1-10 主理人、P1-13 预算。
+1. 飞书真实一轮（P1-09/P1-11 的文字框、适用范围、原地更新取账本正文），然后 P1-10 主理人、P1-13 预算。
+2. P1-15 备份、P1-16 部署（给接单程序一个固定的 `XJ_WORKER_NAME`）、P1-17 简报。
+3. P1-21 对外动作先落账后执行：人定留在一期（2026-11-12），排在上面几项之后、无人值守重启之前。要改由接单程序代做 push、开 PR，范围较大。
 
 ## 卡在哪
 
@@ -26,9 +28,11 @@
 ## 接手须知
 
 - Node 24 直接跑 `.ts`，strip-only 模式不能用构造器参数属性、enum、namespace。
-- 内核只听 `127.0.0.1:7331`；领活要带 `agent`、`at`、`source_id`，返回 `run_id`、`feedback`、`previous`。接单程序不再自己发 `run.claimed`。
-- 接单程序的环境变量：`XJ_WORK_ROOT` 工作目录，`XJ_RECORD_DIR` 录下每轮原始 stream-json（用来做新的录制用例）。内核的 `XJ_TICK_MS` 调定时器间隔。
-- 本机配置 `xuanji.config.json` 不入库，`claude` 档案写了 `model: claude-haiku-5-5`、`capacity: 1`；权限模式没写，沿用本机 Claude Code 的 `auto`。
-- 一期所有任务共用一个工作目录（二期才每任务一个 worktree）。真实一轮里 Agent 在沙盒仓库自建了分支 `feat/greet`，说明共用目录时任务会互相影响。
-- 内核启动时对账本跑 `rebuild()` 是人认可的行为（2026-11-12 定），不需要先问；事件表仍然只追加。
-- 迟到回执（轮次已不在 running）只记在轮次上；被叫停的轮次不交回执。取舍见 `docs/DECISIONS.md` 2026-11-12 一节。
+- 内核只听 `127.0.0.1:7331`；领活要带 `agent`、`at`、`source_id`（接单程序再带 `worker`、`instance`），返回 `run_id`、`feedback`、`recovery`、`previous`。
+- 接单程序的环境变量：`XJ_WORK_ROOT` 工作目录，`XJ_RECORD_DIR` 录下每轮原始 stream-json，`XJ_WORKER_NAME` 接单程序名（默认 `local`）。内核的 `XJ_TICK_MS` 调定时器间隔（默认 60 秒，演练时用 15 秒）。
+- Agent 进程组的 pid 文件在 `data/worker-pids/<接单程序名>/`，接单程序启动时据此清理孤儿进程。
+- 看门狗阈值是归并里的常量（`HEARTBEAT_TIMEOUT_MS`、`RUN_GRACE_MS`），不在配置里，保证重放一致。
+- 本机配置 `xuanji.config.json` 不入库，`claude` 档案写了 `model: claude-haiku-5-5`、`capacity: 1`；权限模式沿用本机 Claude Code 的 `auto`。
+- 一期所有任务共用一个工作目录；Agent 在沙盒里自建了分支 `feat/greet`，之后的提交都在这个分支上。
+- 内核启动时对账本跑 `rebuild()` 是人认可的行为（2026-11-12 定）；事件表仍然只追加。
+- 无界面运行时，Claude Code 会拦下前台的单独 `sleep`，Agent 会改用后台执行。演练用的“先 sleep 再改代码”目标照此能跑通。

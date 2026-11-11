@@ -7,7 +7,8 @@ export interface RunRequest {
   tools?: string[] | undefined;      // 判断点不给工具权限：[]
   permission_mode?: string | undefined;
   timeout_ms: number;
-  label?: string | undefined;        // 这一轮的名字（轮次编号），只用于日志和录制
+  label?: string | undefined;        // 这一轮的名字（轮次编号），只用于日志、录制和 pid 文件
+  onSession?: ((id: string) => void) | undefined;  // 一拿到会话编号就回调，接单程序随心跳上报
 }
 
 export interface RateLimitWindow { utilization: number; resetsAt: number; status: string; }

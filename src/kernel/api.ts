@@ -16,9 +16,9 @@ export function startApi(kernel: Kernel, port: number) {
         return json(res, 200, { seq: e?.seq ?? null, duplicate: e === null });
       }
       if (route === "POST /runs/claim") {            // 接单程序领活；轮次编号由内核签发并返回
-        const b = body as { agent: string; at: string; source_id: string };
+        const b = body as { agent: string; at: string; source_id: string; worker?: string; instance?: string };
         if (!b.agent || !b.at || !b.source_id) return json(res, 400, { error: "领活要带 agent、at、source_id" });
-        const a = kernel.claim(b.agent, b.at, b.source_id);
+        const a = kernel.claim(b.agent, b.at, b.source_id, b.worker && b.instance ? { worker: b.worker, instance: b.instance } : undefined);
         return json(res, 200, a ?? { task: null });
       }
       if (route === "GET /cards") return json(res, 200, kernel.cards());

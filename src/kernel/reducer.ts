@@ -16,6 +16,11 @@ export const RETRY_BACKOFF_MS = [60_000, 300_000];
 export const MAX_FAILURES = RETRY_BACKOFF_MS.length + 1;
 const WAIT_FALLBACK_MS = 3_600_000;     // later 没给 timeout 或认不出时，1 小时后回来看一眼，不无限等
 const RATE_LIMIT_FALLBACK_MS = 900_000; // 限流但拿不到重置时间：15 分钟后再试
+// 看门狗的确定性检查（P1-19）。接单程序每 30 秒心跳一次，连续 6 次没到算心跳超时；
+// 单轮超过预算时长再加 5 分钟宽限算单轮超时（接单程序自己会先在预算时长处结束进程，这里是兜底）。
+// 阈值写死在归并里而不放配置，保证改配置后重放结果不变。
+export const HEARTBEAT_TIMEOUT_MS = 180_000;
+export const RUN_GRACE_MS = 300_000;
 
 export const handlers: Record<string, Handler> = {
   // 人说目标：主理人整理后确认，或小而明确的请求直接立项。
@@ -41,18 +46,34 @@ export const handlers: Record<string, Handler> = {
 
   // 领活：轮次编号在这里签发。内核的 /runs/claim 在同一事务里挑任务并落这条事件，再把编号返回给接单程序。
   "run.claimed": (db, e) => {
-    const p = e.payload as { task_id: string; agent: string; purpose: string };
+    const p = e.payload as { task_id: string; agent: string; purpose: string; worker?: string; instance?: string };
     const rid = formatId("RN", nextId(db, "run"));
-    db.prepare(`INSERT INTO runs(id, task_id, agent, purpose, status, started_at, heartbeat_at) VALUES (?, ?, ?, ?, 'running', ?, ?)`)
-      .run(rid, p.task_id, p.agent, p.purpose, e.at, e.at);
+    db.prepare(`INSERT INTO runs(id, task_id, agent, purpose, status, started_at, heartbeat_at, worker, instance) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)`)
+      .run(rid, p.task_id, p.agent, p.purpose, e.at, e.at, p.worker ?? null, p.instance ?? null);
     setTaskState(db, p.task_id, "running", e.at);
     db.prepare(`UPDATE tasks SET runs_used = runs_used + 1 WHERE id = ?`).run(p.task_id);
     link(db, e.seq, rid);
   },
 
+  // 心跳顺带报会话编号：轮次中途断掉时，恢复的那一轮还能接上原会话。
   "run.heartbeat": (db, e) => {
-    const p = e.payload as { run_id: string };
-    db.prepare(`UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'`).run(e.at, p.run_id);
+    const p = e.payload as { run_id: string; session_id?: string };
+    db.prepare(`UPDATE runs SET heartbeat_at = ?, session_id = COALESCE(session_id, ?) WHERE id = ? AND status = 'running'`)
+      .run(e.at, p.session_id ?? null, p.run_id);
+  },
+
+  // 内核重启（P1-14）：接单程序和 Agent 进程是另外的进程，内核停机不等于它们停了。
+  // 所以这里不判中断，只把执行中轮次的心跳时间刷新到重启时刻，给它们一个心跳超时的宽限；
+  // 进程真不在了，由看门狗的心跳超时或接单程序重启报到来判。
+  "kernel.restarted": (db, e) => graceRunning(db, e, "内核重启"),
+  // 定时器来源发现时间跳了一大段（机器睡眠、进程挂起）：同样给执行中的轮次一个宽限。
+  "timer.resumed": (db, e) => graceRunning(db, e, "机器睡眠或挂起后恢复"),
+
+  // 接单程序启动时报到：同名接单程序的旧实例领的轮次，进程已随旧实例不在，立即判中断。
+  "worker.started": (db, e) => {
+    const p = e.payload as { worker: string; instance: string };
+    const runs = db.prepare(`SELECT id FROM runs WHERE status = 'running' AND worker = ? AND instance IS NOT ?`).all(p.worker, p.instance) as { id: string }[];
+    for (const r of runs) markLost(db, e, r.id, "接单程序重启");
   },
 
   // 回执到了：按六种结果决定任务去向。卡片的生成也在这里，保证与回执同事务。
@@ -70,8 +91,8 @@ export const handlers: Record<string, Handler> = {
     if (p.session_id) db.prepare(`UPDATE tasks SET session_id = ? WHERE id = ?`).run(p.session_id, p.task_id);
     if (getTask(db, p.task_id)?.state !== "running") return;
     const r = p.receipt;
-    // 带给这一轮的反馈已经用掉；连续失败计数只在 failed 时累加。
-    db.prepare(`UPDATE tasks SET feedback = NULL, failures = CASE WHEN ? = 'failed' THEN failures + 1 ELSE 0 END WHERE id = ?`)
+    // 带给这一轮的反馈和恢复说明已经用掉；连续失败计数只在 failed 时累加。
+    db.prepare(`UPDATE tasks SET feedback = NULL, recovery = NULL, failures = CASE WHEN ? = 'failed' THEN failures + 1 ELSE 0 END WHERE id = ?`)
       .run(r.outcome, p.task_id);
     switch (r.outcome) {
       case "done":
@@ -147,8 +168,9 @@ export const handlers: Record<string, Handler> = {
       if (task?.state !== "awaiting_world") continue;
       setTaskState(db, task.id, "queued", e.at);
       clearWaits(db, task.id);
-      link(db, e.seq, task.id);
+      link(db, e.seq, task.id, `定时器到点（${t.due_at}），回队列`);
     }
+    watchdog(db, e);
   },
 
   // 人回答了卡片：回答本身是一条事件；回答落成定论；任务接上，回答作为下一轮的反馈。
@@ -205,9 +227,57 @@ export const handlers: Record<string, Handler> = {
         p.five_hour?.utilization ?? null, p.five_hour ? String(p.five_hour.resetsAt) : null, e.at);
   },
 
-  // TODO P1-14: "kernel.restarted" → 执行中但进程已不在的轮次标为 lost，任务回队列并附恢复说明。
   // TODO P3:   "env.*" → 准入门、研判、订阅直达。
 };
+
+function graceRunning(db: DB, e: Event, why: string): void {
+  const runs = db.prepare(`SELECT id, task_id FROM runs WHERE status = 'running'`).all() as { id: string; task_id: string }[];
+  for (const r of runs) {
+    db.prepare(`UPDATE runs SET heartbeat_at = ? WHERE id = ?`).run(e.at, r.id);
+    link(db, e.seq, r.id, `${why}，等它恢复心跳`);
+    link(db, e.seq, r.task_id, `${r.id} 执行中，${why}后等它恢复心跳`);
+  }
+}
+
+// ---- 看门狗（P1-19）：每次 timer.tick 跑一遍确定性检查。只比较事件自带的 at，不读时钟。----
+function watchdog(db: DB, e: Event): void {
+  const now = Date.parse(e.at);
+  const runs = db.prepare(`SELECT r.id, r.started_at, r.heartbeat_at, t.contract FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.status = 'running'`)
+    .all() as { id: string; started_at: string; heartbeat_at: string; contract: string }[];
+  for (const r of runs) {
+    const budgetMs = (JSON.parse(r.contract) as TaskContract).budget.minutes * 60_000;
+    if (now - Date.parse(r.started_at) > budgetMs + RUN_GRACE_MS) markLost(db, e, r.id, `单轮超时（预算 ${budgetMs / 60_000} 分钟）`);
+    else if (now - Date.parse(r.heartbeat_at) > HEARTBEAT_TIMEOUT_MS) markLost(db, e, r.id, `心跳超时（最后心跳 ${r.heartbeat_at}）`);
+  }
+}
+
+// 轮次中断：标为 lost，任务带恢复说明回队列；知道会话编号就接上原会话。
+// 中断和 failed 共用连续失败计数：连续第 3 次不再自动重派，转受阻出卡片（处置阶梯的最后一级）。
+function markLost(db: DB, e: Event, runId: string, reason: string): void {
+  const run = db.prepare(`SELECT task_id, session_id FROM runs WHERE id = ?`).get(runId) as { task_id: string; session_id: string | null };
+  db.prepare(`UPDATE runs SET status = 'lost', finished_at = ?, lost_reason = ? WHERE id = ?`).run(e.at, reason, runId);
+  link(db, e.seq, runId, `中断：${reason}`);
+  const task = getTask(db, run.task_id);
+  if (task?.state !== "running") { link(db, e.seq, run.task_id, `${runId} 中断：${reason}`); return; }
+  db.prepare(`UPDATE tasks SET failures = failures + 1, session_id = COALESCE(session_id, ?) WHERE id = ?`).run(run.session_id, task.id);
+  const n = task.failures + 1;
+  if (n >= MAX_FAILURES) {
+    setTaskState(db, task.id, "blocked", e.at);
+    createCard(db, e, "decision", task.id, `连续 ${n} 次失败或中断：${reason}`, `最近一轮 ${runId}。确认环境没问题后选“已解除，继续”。`,
+      [{ key: "unblocked", label: "已解除，继续" }, { key: "abandon", label: "放弃" }], `blocked:${task.id}`);
+    link(db, e.seq, task.id, `${runId} 中断：${reason}；连续第 ${n} 次，转受阻`);
+    return;
+  }
+  setTaskState(db, task.id, "queued", e.at);
+  db.prepare(`UPDATE tasks SET recovery = ? WHERE id = ?`).run(recoveryNote(runId, reason), task.id);
+  link(db, e.seq, task.id, `${runId} 中断：${reason}；带恢复说明回队列`);
+}
+
+export function recoveryNote(runId: string, reason: string): string {
+  return `上一轮 ${runId} 没有交回执就中断了（${reason}），它可能做了一半。` +
+    `先检查工作目录、git 历史和远端状态，弄清上一轮已经做到哪一步，再接着做。` +
+    `已经做过的对外动作（push、开 PR、发消息等）不要重复；拿不准是否已经做过时，先查证，查不到就交 ask 回执问人。`;
+}
 
 export function reduce(db: DB, e: Event): void {
   handlers[e.type]?.(db, e);
@@ -222,12 +292,17 @@ export function reduce(db: DB, e: Event): void {
 }
 
 // 把一条事件挂到一个编号上。挂到任务上时顺带挂到它的目标上，这样 xj why G-x 也能看到整条线。
-export function link(db: DB, seq: number, ref: string): void {
+// note 写明归并对这个编号做了什么；同一条事件对同一编号的说明只留第一条。
+export function link(db: DB, seq: number, ref: string, note?: string): void {
   if (!ref) return;
-  db.prepare(`INSERT OR IGNORE INTO event_refs(ref, seq) VALUES (?, ?)`).run(ref, seq);
+  const put = (r: string) => {
+    db.prepare(`INSERT OR IGNORE INTO event_refs(ref, seq, note) VALUES (?, ?, ?)`).run(r, seq, note ?? null);
+    if (note) db.prepare(`UPDATE event_refs SET note = ? WHERE ref = ? AND seq = ? AND note IS NULL`).run(note, r, seq);
+  };
+  put(ref);
   if (/^T-\d+$/.test(ref)) {
     const t = db.prepare(`SELECT goal_id FROM tasks WHERE id = ?`).get(ref) as { goal_id: string } | undefined;
-    if (t) db.prepare(`INSERT OR IGNORE INTO event_refs(ref, seq) VALUES (?, ?)`).run(t.goal_id, seq);
+    if (t) put(t.goal_id);
   }
 }
 

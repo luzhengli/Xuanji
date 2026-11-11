@@ -44,9 +44,13 @@ function showEvent(e: Event): string {
     case "run.heartbeat": what = String(p.run_id); break;
     case "card.answered": what = `${p.card_id} → ${p.choice ?? ""}${p.text ? `：${p.text}` : ""}`; break;
     case "human.stop": what = String(p.about); break;
+    case "kernel.restarted": what = "内核重启"; break;
+    case "worker.started": what = `接单程序 ${p.worker} 启动`; break;
+    case "timer.tick": what = ""; break;
+    case "timer.resumed": what = `时间跳了 ${Math.round(Number(p.gap_ms) / 60_000)} 分钟`; break;
     default: what = JSON.stringify(p).slice(0, 120);
   }
-  return `#${e.seq}  ${e.at}  ${e.source.padEnd(6)} ${e.type.padEnd(16)} ${what}`;
+  return `#${e.seq}  ${e.at}  ${e.source.padEnd(6)} ${e.type.padEnd(16)} ${what}${e.note ? `${what ? "  " : ""}→ ${e.note}` : ""}`;
 }
 
 type Overview = {

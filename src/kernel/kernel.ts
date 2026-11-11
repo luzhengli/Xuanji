@@ -17,8 +17,12 @@ export interface Claim {
   purpose: "execute";
   run_id: string;
   feedback: string | null;
+  recovery: string | null;     // 上一轮中断后的恢复说明（P1-14）
   previous: Receipt | null;
 }
+
+// 领活的是哪个接单程序。它重启后报到（worker.started），旧实例领的轮次即判中断。
+export interface WorkerIdentity { worker: string; instance: string; }
 
 export class Kernel {
   readonly db: DB;
@@ -52,18 +56,18 @@ export class Kernel {
 
   // 领活：挑任务和落 run.claimed 在同一事务里，两个接单程序不会领到同一件。
   // 时间和来源编号由接单程序给（内核不读时钟），轮次编号由归并按计数器签发，重放一致。
-  claim(agent: string, at: string, source_id: string): Claim | null {
+  claim(agent: string, at: string, source_id: string, who?: WorkerIdentity): Claim | null {
     return transaction(this.db, () => {
       const a = pickNext(this.db, this.cfg, agent);
       if (!a) return null;
       const before = a.task;
       const e = this.apply({ source: "worker", source_id, type: "run.claimed", at, about: before.id,
-        payload: { task_id: before.id, agent, purpose: a.purpose } });
+        payload: { task_id: before.id, agent, purpose: a.purpose, ...(who ?? {}) } });
       if (!e) return null; // 同一个来源编号重复领活：不再派第二次
       const run = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC, rowid DESC LIMIT 1`)
         .get(before.id) as { id: string };
       return { task: getTask(this.db, before.id)!, agent, purpose: a.purpose, run_id: run.id,
-        feedback: before.feedback, previous: this.lastReceipt(before.id) };
+        feedback: before.feedback, recovery: before.recovery, previous: this.lastReceipt(before.id) };
     });
   }
 
