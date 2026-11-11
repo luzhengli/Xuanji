@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS timers (
 CREATE TABLE IF NOT EXISTS event_refs (
   ref TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (ref, seq)
 );
+-- 判断点（P1-10 起）：主理人整理目标卡等无工具的模型调用。输入输出都落账。
+CREATE TABLE IF NOT EXISTS judgments (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, about TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL,
+  output TEXT, error TEXT, failures INTEGER NOT NULL DEFAULT 0, agent TEXT, worker TEXT, instance TEXT,
+  session_id TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS judgments_status ON judgments(status);
 CREATE TABLE IF NOT EXISTS quota (
   agent TEXT PRIMARY KEY, seven_day_utilization REAL, seven_day_resets_at TEXT,
   five_hour_utilization REAL, five_hour_resets_at TEXT, observed_at TEXT
@@ -78,6 +85,7 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["runs", "instance", "TEXT"],                           // 领活的接单程序实例；它重启后，旧实例的轮次即中断
   ["runs", "lost_reason", "TEXT"],
   ["event_refs", "note", "TEXT"],                         // 归并对这个编号做了什么（看门狗判中断等），给 xj why 看
+  ["cards", "form", "TEXT"],                              // 卡片样式：goal / budget / brief / reply（P1-10、P1-13、P1-17）
 ];
 
 export function openStore(path: string): DB {
@@ -105,7 +113,7 @@ export function nextId(db: DB, name: string): number {
 
 // 投影可以从事件日志重建：清空所有投影表，不动 events。
 export function clearProjections(db: DB): void {
-  for (const t of ["event_refs", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
+  for (const t of ["event_refs", "judgments", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
     db.exec(`DELETE FROM ${t}`);
   }
 }

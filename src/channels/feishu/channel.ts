@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { renderCard, renderAnswered, parseButtonName, SCOPES } from "./cards.ts";
 import { route, HELP } from "./commands.ts";
 import { showStatus, splitCards, type Overview } from "../format.ts";
+import { localDate } from "../../sources/timer.ts";
 import type { Card, RulingScope } from "../../kernel/types.ts";
 
 const execFileP = promisify(execFile);
@@ -102,7 +103,7 @@ export class FeishuChannel {
     if (key === "card.action.trigger") return this.onClick(ev);
   }
 
-  // 发消息就是说目标；“卡片”“待办”/card 回待处理卡片；/status 看全局。
+  // 发消息就是说目标，交给主理人整理成目标卡（P1-10）；“卡片”“待办”/card 回待处理卡片；/status 看全局。
   private async onMessage(ev: Record<string, unknown>): Promise<void> {
     if (ev.sender_id !== this.deps.owner_open_id) return;        // 其他人的消息不算
     if (ev.chat_type !== "p2p") return;                          // 只在私聊里收发，不进群
@@ -114,10 +115,24 @@ export class FeishuChannel {
     const r = route(String(ev.content ?? ""));
     switch (r.kind) {
       case "goal": {
-        // 一期直接立项（人定 2026-11-12）。来源编号用飞书的 message_id，长连接重投时内核会去重，也不会重复回复。
-        const res = await this.deps.kernel.emit("goal.confirmed", `msg:${mid}`, { title: r.title, message_id: mid });
+        // 来源编号用飞书的 message_id，长连接重投时内核会去重，也不会重复回复。目标卡或主理人的答复由 pushPending 推来。
+        const res = await this.deps.kernel.emit("human.message", `msg:${mid}`, { text: r.title, message_id: mid, via: "feishu" });
         if (res.duplicate) return;
-        await this.deps.lark.sendText(`已立项 ${res.refs.join(" · ")}：${r.title}\n做完会出审核卡；发 /card 看待处理的卡片，/status 看进度。`, idem("r", mid));
+        const goal = res.refs.find((x) => x.startsWith("G-")) ?? "";
+        await this.deps.lark.sendText(`收到（${goal}）。主理人整理好目标卡就发给你确认；小而明确的会直接立项。`, idem("r", mid));
+        return;
+      }
+      case "brief": {
+        // 手动要一份简报：和每天定时的一样，汇总后收起知会卡；简报卡随即推来。
+        const res = await this.deps.kernel.emit("brief.due", `brief:${mid}`, { date: localDate(new Date()), manual: true });
+        if (!res.duplicate) await this.pushPending();
+        return;
+      }
+      case "stop": {
+        const res = await this.deps.kernel.emit("human.stop", `msg:${mid}`, { about: r.about, via: "feishu" }, r.about);
+        if (res.duplicate) return;
+        const t = await this.deps.kernel.get<{ state: string }>(`/tasks/${encodeURIComponent(r.about)}`).catch(() => null);
+        await this.deps.lark.sendText(t ? `已叫停 ${r.about}（现在 ${t.state}）。` : `没有 ${r.about} 这个任务。`, idem("r", mid));
         return;
       }
       case "cards": return this.sendPending(mid);
@@ -140,10 +155,11 @@ export class FeishuChannel {
     await this.deps.lark.sendText(lines.join("\n"), idem("r", mid));
   }
 
-  // 补发：阻塞性的决策卡还没送达的推给你；审核卡和知会卡不推，发 /card 时再给（P1-17 简报之前的过渡）。
+  // 补发：内核标了要推送的卡片（决策卡、目标卡、超预算卡、简报、主理人的答复）还没送达的推给你；
+  // 审核卡和知会卡不推，随简报汇总，或发 /card 时再给。
   async pushPending(): Promise<void> {
     for (const c of await this.deps.kernel.get<Card[]>("/cards")) {
-      if (c.kind !== "decision" || c.external_ref) continue;
+      if (!c.push || c.external_ref) continue;
       await this.deliver(c, idem("push", c.id));
     }
   }
@@ -159,11 +175,12 @@ export class FeishuChannel {
     if (!click) return;
     const card = await this.deps.kernel.get<Card>(`/cards/${encodeURIComponent(click.card_id)}`).catch(() => null);
     if (!card) return;
-    const choice = click.option_index !== undefined ? card.options[click.option_index]?.key : click.choice;
+    const option = click.option_index !== undefined ? card.options[click.option_index] : card.options.find((o) => o.key === click.choice);
+    const choice = option?.key ?? click.choice;
     const text = click.text?.trim() || undefined;
     if (card.status === "open") {
-      if (!choice && !text) {
-        await this.deps.lark.sendText(`${card.id}：点“用上面这句话回答”之前，要先在文字框里写一句话。`, idem("e", click.event_id));
+      if (!text && (!choice || option?.needs_text)) {
+        await this.deps.lark.sendText(`${card.id}：点“${option?.label ?? "用上面这句话回答"}”之前，要先在文字框里写一句话。`, idem("e", click.event_id));
         return;
       }
       await this.deps.kernel.emit("card.answered", `click:${click.event_id}`,

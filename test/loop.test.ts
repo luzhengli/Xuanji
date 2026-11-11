@@ -52,7 +52,7 @@ async function harness(files: string[]) {
   const xj = async (...args: string[]) => (await execFileP(process.execPath, [XJ, ...args], { env: { ...process.env, XJ_CONFIG: cfgPath } })).stdout;
   const xjJson = async <T>(...args: string[]) => JSON.parse(await xj(...args, "--json")) as T;
   const close = () => new Promise<void>((r) => { server.close(() => r()); kernel.close(); });
-  return { kernel, adapter, worker, xj, xjJson, logs, close };
+  return { kernel, adapter, worker, xj, xjJson, logs, close, base: `http://127.0.0.1:${port}`, dir };
 }
 
 type Overview = { goals: { id: string; status: string }[]; tasks: { id: string; state: string; session_id: string | null }[];
@@ -61,7 +61,7 @@ type Overview = { goals: { id: string; status: string }[]; tasks: { id: string; 
 test("验收 1：xj goal → 接单程序跑一轮 → 回执入账 → 审核卡 → xj answer C-1 accept → 任务和目标都是 done", async () => {
   const h = await harness(["real-t1-done.ndjson"]);
   try {
-    await h.xj("goal", "在 math.mjs 里新增并导出函数 sub(a, b)");
+    await h.xj("goal", "--direct", "在 math.mjs 里新增并导出函数 sub(a, b)");
     assert.equal(await h.worker.once("claude"), true, "接单程序领到活");
     assert.equal(await h.worker.once("claude"), false, "没有第二件");
     assert.equal(h.adapter.requests[0]!.label, "RN-1", "轮次编号由内核签发，不再是 TODO");
@@ -88,7 +88,7 @@ test("验收 1：xj goal → 接单程序跑一轮 → 回执入账 → 审核�
 test("验收 2：问人路径：ask 回执出决策卡；xj answer 后下一轮 --resume 接上原会话，两轮 session_id 相同", async () => {
   const h = await harness(["real-t2-ask.ndjson", "real-t2-resume-done.ndjson"]);
   try {
-    await h.xj("goal", "在 math.mjs 新增 greet(name)，语言先问我");
+    await h.xj("goal", "--direct", "在 math.mjs 新增 greet(name)，语言先问我");
     await h.worker.once("claude");
     const decision = (await h.xjJson<Card[]>("cards")).find((c) => c.kind === "decision")!;
     assert.ok(decision, "得到决策卡");
@@ -119,7 +119,7 @@ test("验收 2：问人路径：ask 回执出决策卡；xj answer 后下一轮 
 test("验收 3：xj why T-1 列出从立项到验收的全部事件（P1-18 关联表）", async () => {
   const h = await harness(["real-t1-done.ndjson"]);
   try {
-    await h.xj("goal", "在 math.mjs 里新增并导出函数 sub(a, b)");
+    await h.xj("goal", "--direct", "在 math.mjs 里新增并导出函数 sub(a, b)");
     await h.worker.once("claude");
     await h.xj("answer", "C-1", "accept");
     const ev = await h.xjJson<Event[]>("why", "T-1");
@@ -201,4 +201,31 @@ test("接单程序：回执格式错了不重做业务，只在原会话里请 A
     assert.match(seen[1]!.prompt, /回执格式错误/);
     assert.equal(kernel.task("T-1")!.state, "awaiting_review");
   } finally { server.close(); kernel.close(); }
+});
+
+test("验收 4：xj goal 经主理人出目标卡 → xj answer confirm → 跑一轮；xj why 折叠心跳；xj brief 出简报并收起知会卡", async () => {
+  const h = await harness(["real-t1-done.ndjson"]);
+  try {
+    assert.match(await h.xj("goal", "在 math.mjs 里新增并导出函数 sub(a, b)"), /^收到 G-1（事件 #1）。主理人整理好目标卡后用 xj cards 查看/);
+    assert.equal(await h.worker.once("claude"), false, "确认之前没有活");
+    const draft = { kind: "goal", direct: false, title: "math.mjs 新增并导出 sub(a, b)", acceptance: ["sub(5, 3) 返回 2"], boundaries: [], ask_first: [] };
+    const principal: AgentAdapter = { name: "claude", run: async () => ({ last_message: JSON.stringify(draft), session_id: "s-j", exit_code: 0, usage: {}, rate_limited: false, stderr: "" }) };
+    await new Worker(kernelClient(h.base, "worker"), { claude: principal }, h.dir, { log: () => {} }).judgeOnce("claude");
+    assert.match(await h.xj("cards"), /C-1 \[决策\] G-1  目标卡：math\.mjs 新增并导出 sub\(a, b\)[\s\S]*选项：confirm（推荐） \/ revise \/ drop/);
+    await h.xj("answer", "C-1", "confirm");
+    assert.equal(await h.worker.once("claude"), true);
+    assert.match(h.adapter.requests[0]!.prompt, /验收：- sub\(5, 3\) 返回 2/, "目标卡上的验收标准进了提示词");
+
+    for (let i = 0; i < 4; i++) {
+      h.kernel.ingest({ source: "worker", source_id: `hb${i}`, type: "run.heartbeat", at: `2026-11-12T10:0${i}:00.000Z`, about: "T-1", payload: { run_id: "RN-1", task_id: "T-1" } });
+    }
+    const folded = await h.xj("why", "T-1");
+    assert.match(folded, /心跳 4 次（RN-1）/);
+    assert.doesNotMatch(folded, /run\.heartbeat/);
+    assert.equal((await h.xj("why", "T-1", "--all")).match(/run\.heartbeat/g)!.length, 4, "--all 全部列出");
+    assert.match(await h.xj("why", "G-1"), /human\.message\s+“在 math\.mjs 里新增并导出函数 sub\(a, b\)”[\s\S]*judgment\.result\s+J-1 目标卡：math\.mjs 新增并导出 sub/);
+
+    const brief = await h.xj("brief");
+    assert.match(brief, /^C-\d+ \[知会\] 简报  简报 \d{4}-\d{2}-\d{2}\n    \*\*需要你\*\*：审核 1 张/);
+  } finally { await h.close(); }
 });

@@ -116,9 +116,12 @@ export interface Receipt {
 
 // ---- 卡片 ----
 export type CardKind = "decision" | "review" | "notice";
-export type CardStatus = "open" | "answered" | "expired" | "withdrawn";
+export type CardStatus = "open" | "answered" | "expired" | "withdrawn" | "folded";   // folded：知会卡随简报汇总后收起（P1-22）
 
-export interface CardOption { key: string; label: string; recommended?: boolean; }
+// 卡片的样式：目标卡（主理人整理的，确认/修改/不做）、超预算卡、简报、主理人的答复。普通卡片为 null。
+export type CardForm = "goal" | "budget" | "brief" | "reply";
+
+export interface CardOption { key: string; label: string; recommended?: boolean; needs_text?: boolean; }
 
 export interface Card {
   id: string;
@@ -131,8 +134,54 @@ export interface Card {
   status: CardStatus;
   answer: { choice?: string; text?: string; scope?: RulingScope } | null;
   external_ref: string | null;   // 飞书 message_id
+  form: CardForm | null;
+  push?: boolean;                // 内核定的：要不要主动推给人（注意力调度），只在读出时算，不入库
   created_at: string;
   updated_at: string;
+}
+
+// ---- 判断点 ----
+// 研判、规划、验证、主理人对话是无状态的模型调用，经接单程序起一次不给工具的 Agent（“判断点也是一轮”）。
+// 一期只有主理人整理目标卡（intake）。轮次表的 task_id 不能为空，所以判断点单独一张表，编号 J-x。
+export type JudgmentKind = "intake";
+export type JudgmentStatus = "queued" | "running" | "finished" | "failed";
+
+export interface IntakeInput {
+  request: string;               // 人的原话
+  revision: number;              // 第几次修改，0 是初稿
+  draft?: Draft | undefined;     // 上一版目标卡
+  feedback?: string | undefined; // 人的修改意见
+}
+
+export interface Judgment {
+  id: string;
+  kind: JudgmentKind;
+  about: string;                 // G-x
+  status: JudgmentStatus;
+  input: IntakeInput;
+  output: unknown;
+  error: string | null;
+  failures: number;
+  agent: string | null;
+  worker: string | null;
+  instance: string | null;
+  session_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
+// 主理人整理出的目标卡草稿。自主级别不在里面：权限只由人或人写的规则授予。
+export interface Draft {
+  kind: "goal" | "not_goal";
+  direct: boolean;               // 小而明确，跳过确认直接立项
+  title: string;
+  acceptance: string[];
+  boundaries: string[];
+  ask_first: string[];
+  notes?: string[] | undefined;  // 提醒：人确认前该知道的情况（例如要加的函数已经有了），只上卡片，不进契约
+  budget?: { runs: number; minutes: number } | undefined;   // 只有人明确提到才有
+  reply?: string | undefined;    // 不是目标时回人的一句话
 }
 
 // ---- 定论 ----

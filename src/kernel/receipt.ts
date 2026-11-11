@@ -6,7 +6,8 @@ const OUTCOMES: Outcome[] = ["done", "waiting", "ask", "blocked", "failed", "not
 
 export type ParseResult = { ok: true; receipt: Receipt } | { ok: false; error: string };
 
-export function parseReceipt(lastMessage: string): ParseResult {
+// 最后一条消息里可能是 JSON 的片段：围栏里的、整条、第一个 { 到最后一个 }。回执和判断点的输出共用。
+export function jsonCandidates(lastMessage: string): string[] {
   const text = lastMessage.trim();
   const candidates: string[] = [];
   const fence = /```(?:json)?\s*([\s\S]*?)```/g;
@@ -14,9 +15,12 @@ export function parseReceipt(lastMessage: string): ParseResult {
   candidates.push(text);
   const first = text.indexOf("{"), last = text.lastIndexOf("}");
   if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+  return candidates;
+}
 
+export function parseReceipt(lastMessage: string): ParseResult {
   let lastErr = "没有找到 JSON 对象";
-  for (const c of candidates) {
+  for (const c of jsonCandidates(lastMessage)) {
     let obj: unknown;
     try { obj = JSON.parse(c); } catch { continue; }
     const v = validate(obj);

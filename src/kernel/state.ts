@@ -19,10 +19,11 @@ const TRANSITIONS: Record<TaskState, TaskState[]> = {
   queued:          ["running", "awaiting_deps", "stopped", "abandoned"],
   running:         ["verifying", "awaiting_answer", "awaiting_world", "blocked", "queued", "stopped", "done"],
   verifying:       ["awaiting_review", "queued", "done", "stopped"],
-  awaiting_answer: ["queued", "stopped", "abandoned"],
-  awaiting_review: ["done", "queued", "stopped"],
+  // 回队列前查预算（P1-13）：超了就转受阻出卡片，所以等人、等世界的状态都可以直接转受阻。
+  awaiting_answer: ["queued", "blocked", "stopped", "abandoned"],
+  awaiting_review: ["done", "queued", "blocked", "stopped"],
   blocked:         ["queued", "abandoned", "stopped"],
-  awaiting_world:  ["queued", "stopped", "abandoned"],
+  awaiting_world:  ["queued", "blocked", "stopped", "abandoned"],
   awaiting_deps:   ["queued", "stopped", "abandoned"],
   done: [], abandoned: [], stopped: [],
 };

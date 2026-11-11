@@ -46,7 +46,7 @@ test("私聊一句话怎么分流：命令、中文关键词、其余直接立�
 
 test("渲染：决策卡带文字框、适用范围和“用这句话回答”；审核卡只有文字框；知会卡没有按钮", () => {
   const base: Card = { id: "C-7", kind: "decision", about: "T-2", title: "时区按哪个", body: "b", dedupe_key: "k", status: "open",
-    options: [{ key: "服务器", label: "服务器", recommended: true }, { key: "用户", label: "用户" }], answer: null, external_ref: null, created_at: "", updated_at: "" };
+    options: [{ key: "服务器", label: "服务器", recommended: true }, { key: "用户", label: "用户" }], answer: null, external_ref: null, form: null, created_at: "", updated_at: "" };
   const form = (c: Card) => ((renderCard(c).body as { elements: { tag: string; elements?: { tag: string; name: string; text?: { content: string } }[] }[] }).elements.find((e) => e.tag === "form"));
   const d = form(base)!.elements!;
   assert.deepEqual(d.map((e) => e.tag), ["input", "select_static", "button", "button", "button"]);
@@ -92,19 +92,28 @@ async function setup() {
 }
 
 const at = "2026-11-12T09:00:00.000Z";
+// 主理人交一份草稿（代替接单程序起 Claude Code）。
+function principal(k: Kernel, output: Record<string, unknown>) {
+  const j = k.claimJudgment("claude", at, `j-${Math.random()}`)!;
+  k.ingest({ source: "worker", source_id: `jr-${Math.random()}`, type: "judgment.result", at, about: j.about, payload: { judgment_id: j.id, output } });
+  return j;
+}
+// 直接立项（这几个用例看的是卡片，不是主理人）。
+const directGoal = (k: Kernel, title: string) => k.ingest({ source: "cli", source_id: `g-${Math.random()}`, type: "goal.confirmed", at, payload: { title } });
 function finishRound(k: Kernel, receipt: Record<string, unknown>) {
   const c = k.claim("claude", at, `claim-${Math.random()}`)!;
   k.ingest({ source: "worker", source_id: `r-${Math.random()}`, type: "run.receipt", at, payload: { run_id: c.run_id, task_id: c.task.id, session_id: "s1", receipt } });
 }
 
-test("飞书一轮：一句话立项 → 回执出审核卡 → 发 /card 收到卡片 → 在卡片上点接受 → 任务和目标 done，卡片原地改成结论", async () => {
+test("飞书一轮：一句话 → 主理人出目标卡并推来 → 确认立项 → 回执出审核卡 → /card 取卡 → 点接受 → done，卡片原地改成结论", async () => {
   const h = await setup();
   try {
     await h.say("在 math.mjs 加一个 div 函数");
-    assert.equal(h.kernel.overview().goals.length, 1);
-    assert.match(h.lark.texts.at(-1)!, /^已立项 G-1 · T-1：在 math\.mjs 加一个 div 函数/);
+    assert.deepEqual(h.kernel.overview().goals.map((g) => (g as { status: string }).status), ["proposed"]);
+    assert.equal(h.kernel.overview().tasks.length, 0, "确认之前不立任务");
+    assert.match(h.lark.texts.at(-1)!, /^收到（G-1）。主理人整理好目标卡就发给你确认/);
 
-    // 长连接重投同一条消息：不重复立项，不重复回复
+    // 长连接重投同一条消息：不重复记，不重复回复
     await h.channel.handle("im.message.receive_v1", JSON.stringify({ message_id: "om_in_1", chat_type: "p2p", message_type: "text", sender_id: OWNER, content: "在 math.mjs 加一个 div 函数" }));
     assert.equal(h.kernel.overview().goals.length, 1); assert.equal(h.lark.texts.length, 1);
     // 别人的消息、群里的消息都不算
@@ -112,27 +121,42 @@ test("飞书一轮：一句话立项 → 回执出审核卡 → 发 /card 收到
     await h.say("群里说的", { chat_type: "group" });
     assert.equal(h.kernel.overview().goals.length, 1);
 
+    principal(h.kernel, { kind: "goal", direct: false, title: "math.mjs 新增 div(a, b)", acceptance: ["div(6, 3) 返回 2", "除以 0 抛错"], boundaries: ["只改 math.mjs"], ask_first: [] });
+    await h.channel.pushPending();
+    assert.equal(h.lark.cards.length, 1, "目标卡主动推来");
+    const goalCard = JSON.stringify(h.lark.cards[0]!.card);
+    assert.match(goalCard, /目标卡：math\.mjs 新增 div\(a, b\)/);
+    assert.match(goalCard, /验收\*\*\\n- div\(6, 3\) 返回 2\\n- 除以 0 抛错/);
+    assert.match(goalCard, /L1 做到可审核为止 · 预算 8 轮或 2 小时/);
+    assert.doesNotMatch(goalCard, /select_static|用上面这句话回答/, "目标卡没有适用范围，也没有“用这句话回答”");
+
+    await h.click("xj_C_1_o0", {});        // 确认
+    const goals = h.kernel.overview().goals as { id: string; title: string; status: string }[];
+    assert.deepEqual([goals[0]!.status, goals[0]!.title], ["active", "math.mjs 新增 div(a, b)"]);
+    assert.deepEqual(h.kernel.task("T-1")!.contract.acceptance.criteria, ["div(6, 3) 返回 2", "除以 0 抛错"], "验收标准进了任务契约");
+    assert.match(JSON.stringify(h.lark.updates[0]!.card), /结论\*\*：确认/);
+
     finishRound(h.kernel, { outcome: "done", summary: "div 加好了", handoff: "见 math.mjs", found: [{ title: "没有测试" }] });
     await h.channel.pushPending();
-    assert.equal(h.lark.cards.length, 0, "审核卡不主动推送");
+    assert.equal(h.lark.cards.length, 1, "审核卡不主动推送");
 
     await h.say("/card");
-    assert.equal(h.lark.cards.length, 1, "只发要你处理的那张，知会卡只列标题");
-    assert.match(JSON.stringify(h.lark.cards[0]!.card), /"name":"xj_C_1_o0"/);
-    assert.match(h.lark.texts.at(-1)!, /以上 1 张卡片待你处理。\n知会 1 条（不需要动作）：\n· C-2 发现：没有测试/);
-    assert.equal(h.kernel.card("C-1")!.external_ref, "om_1", "送达记账");
+    assert.equal(h.lark.cards.length, 2, "只发要你处理的那张，知会卡只列标题");
+    assert.match(JSON.stringify(h.lark.cards[1]!.card), /"name":"xj_C_2_o0"/);
+    assert.match(h.lark.texts.at(-1)!, /以上 1 张卡片待你处理。\n知会 1 条（不需要动作）：\n· C-3 发现：没有测试/);
+    assert.equal(h.kernel.card("C-2")!.external_ref, "om_2", "送达记账");
 
-    await h.click("xj_C_1_o0", { text: "" });
+    await h.click("xj_C_2_o0", { text: "" });
     const o = h.kernel.overview();
     assert.equal(o.tasks[0]!.state, "done"); assert.equal((o.goals[0] as { status: string }).status, "done");
-    assert.equal(h.kernel.card("C-1")!.answer!.choice, "accept");
-    assert.match(JSON.stringify(h.lark.updates[0]!.card), /"template":"green".*结论\*\*：接受/);
+    assert.equal(h.kernel.card("C-2")!.answer!.choice, "accept");
+    assert.match(JSON.stringify(h.lark.updates[1]!.card), /"template":"green".*结论\*\*：接受/);
 
     // 再点一次（或点旧卡片）：不再记账，卡片仍显示账本里的结论
-    const before = h.kernel.why("C-1").length;
-    await h.click("xj_C_1_o2", {});
-    assert.equal(h.kernel.why("C-1").length, before);
-    assert.match(JSON.stringify(h.lark.updates[1]!.card), /结论\*\*：接受/);
+    const before = h.kernel.why("C-2").length;
+    await h.click("xj_C_2_o2", {});
+    assert.equal(h.kernel.why("C-2").length, before);
+    assert.match(JSON.stringify(h.lark.updates[2]!.card), /结论\*\*：接受/);
 
     await h.say("/status");
     assert.match(h.lark.texts.at(-1)!, /需要你：没有；另有 1 张知会卡[\s\S]*G-1 \[done\]/);
@@ -142,7 +166,7 @@ test("飞书一轮：一句话立项 → 回执出审核卡 → 发 /card 收到
 test("决策卡：主动推送一次；用文字框回答并选适用范围，落成定论，回答带进下一轮", async () => {
   const h = await setup();
   try {
-    await h.say("给 greet 定语言");
+    directGoal(h.kernel, "给 greet 定语言");
     finishRound(h.kernel, { outcome: "ask", summary: "要定", ask: [{ question: "问候语用中文还是英文", options: ["中文", "英文"], recommended: "中文" }] });
     await h.channel.pushPending();
     await h.channel.pushPending();
@@ -166,7 +190,7 @@ test("决策卡：主动推送一次；用文字框回答并选适用范围，�
 test("审核卡退回并附意见：意见作为下一轮的反馈", async () => {
   const h = await setup();
   try {
-    await h.say("加 div");
+    directGoal(h.kernel, "加 div");
     finishRound(h.kernel, { outcome: "done", summary: "好了", handoff: "h" });
     await h.click("xj_C_1_o1", { text: "除以 0 要报错" });
     assert.equal(h.kernel.task("T-1")!.state, "queued");
@@ -197,17 +221,104 @@ test("真实点击：表单按钮带 action_name 和 form_value，没有 action_
   ]);
 });
 
-test("真实消息：私聊文字的 content 是纯文本；立项、/card、/status 各自分流，重投不重复立项", async () => {
+test("真实消息：私聊文字的 content 是纯文本；说目标、/card、/status 各自分流，重投不重复记", async () => {
   const h = await setup();
   try {
     const msgs = realLines("feishu-real-messages.ndjson");
     assert.deepEqual(msgs.map((l) => route(JSON.parse(l).content).kind), ["goal", "cards", "goal", "cards", "status"]);
     for (const l of msgs) await h.channel.handle("im.message.receive_v1", l);
     for (const l of msgs) await h.channel.handle("im.message.receive_v1", l);   // 长连接整批重投
-    const goals = h.kernel.overview().goals as { title: string }[];
+    const goals = h.kernel.overview().goals as { title: string; status: string }[];
     assert.equal(goals.length, 2);
     assert.ok(goals[0]!.title.startsWith("在 math.mjs 新增并导出函数 div(a, b)") && goals[1]!.title.startsWith("在 math.mjs 新增并导出 greet2(name)"));
-    assert.match(h.lark.texts[0]!, /^已立项 G-1 · T-1：在 math\.mjs 新增并导出函数 div/);
+    assert.deepEqual(goals.map((g) => g.status), ["proposed", "proposed"], "交给主理人整理，等人确认");
+    assert.match(h.lark.texts[0]!, /^收到（G-1）/);
     assert.equal(h.lark.texts.length, 5, "每条消息只回一次");
   } finally { await h.close(); }
+});
+
+// ---- P1-10 / P1-13 / P1-17 在飞书上的样子 ----
+
+test("目标卡点“修改”不写意见：提示先写，不记账；写了意见再点，交给主理人重整", async () => {
+  const h = await setup();
+  try {
+    await h.say("加 div");
+    principal(h.kernel, { kind: "goal", direct: false, title: "div", acceptance: ["能除"] });
+    await h.click("xj_C_1_o1", { text: " " });
+    assert.equal(h.kernel.card("C-1")!.status, "open");
+    assert.match(h.lark.texts.at(-1)!, /C-1：点“修改”之前，要先在文字框里写一句话。/);
+    await h.click("xj_C_1_o1", { text: "除以 0 要报错" });
+    assert.equal(h.kernel.card("C-1")!.answer!.choice, "revise");
+    assert.equal(h.kernel.judgment("J-2")!.input.feedback, "除以 0 要报错");
+    assert.match(JSON.stringify(h.lark.updates.at(-1)!.card), /结论\*\*：修改.*说明\*\*：除以 0 要报错/);
+  } finally { await h.close(); }
+});
+
+test("推送：目标卡、主理人的答复、简报、超预算卡推；审核卡和普通知会卡不推", async () => {
+  const h = await setup();
+  try {
+    await h.say("你好");
+    principal(h.kernel, { kind: "not_goal", reply: "你好，有事直接说。" });          // C-1 答复，推
+    await h.say("加 div");
+    principal(h.kernel, { kind: "goal", direct: true, title: "div", acceptance: ["能除"] }); // C-2 已立项，推
+    finishRound(h.kernel, { outcome: "done", summary: "好了", handoff: "h", found: [{ title: "没测试" }] });  // C-3 审核、C-4 知会，不推
+    await h.channel.pushPending();
+    const titles = () => h.lark.cards.map((c) => (c.card.header as { title: { content: string } }).title.content);
+    assert.deepEqual(titles(), ["主理人：你好，有事直接说。", "已立项 G-2 · T-1：div"]);
+
+    await h.say("简报");
+    assert.equal(titles().at(-1), `简报 ${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}-${String(new Date().getDate()).padStart(2, "0")}`);
+    const body = JSON.stringify(h.lark.cards.at(-1)!.card);
+    assert.match(body, /审核 1 张/);
+    assert.match(body, /知会\*\* 3 条（已收起）/, "两条答复和一条发现都收起");
+    assert.equal(h.kernel.card("C-4")!.status, "folded");
+    await h.say("/card");
+    assert.doesNotMatch(h.lark.texts.at(-1)!, /C-4/, "收起的知会卡不再列出");
+  } finally { await h.close(); }
+});
+
+test("超预算卡：推来，没有适用范围；点“追加”回队列", async () => {
+  const h = await setup();
+  try {
+    h.kernel.ingest({ source: "cli", source_id: "g-budget", type: "goal.confirmed", at, payload: { title: "x", grant: { budget: { runs: 1, minutes: 120 } } } });
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "甲还是乙", options: ["甲", "乙"] }] });
+    await h.click("xj_C_1_o0", {});
+    await h.channel.pushPending();
+    const budget = h.lark.cards.find((c) => /超出预算/.test(JSON.stringify(c.card)))!;
+    const json = JSON.stringify(budget.card);
+    assert.match(json, /"content":"追加 4 轮和 1 小时"[\s\S]*"content":"停掉（推荐）"[\s\S]*"content":"接管"/);
+    assert.doesNotMatch(json, /select_static|用上面这句话回答/);
+    await h.click("xj_C_2_o0", {});
+    assert.equal(h.kernel.task("T-1")!.state, "queued");
+    assert.equal(h.kernel.task("T-1")!.contract.budget.runs, 5);
+  } finally { await h.close(); }
+});
+
+test("/stop T-x：叫停任务并回一句；格式不对回用法", async () => {
+  const h = await setup();
+  try {
+    directGoal(h.kernel, "x");
+    await h.say("/stop t-1");
+    assert.equal(h.kernel.task("T-1")!.state, "stopped");
+    assert.match(h.lark.texts.at(-1)!, /已叫停 T-1（现在 stopped）/);
+    assert.deepEqual(route("/stop"), { kind: "help" });
+    assert.deepEqual(route("/brief"), { kind: "brief" });
+  } finally { await h.close(); }
+});
+
+test("真实点击（2026-11-12 第二轮）：目标卡文字框写了字再点“修改”，form_value 带着这句话；超预算卡、审核卡没有适用范围", () => {
+  const clicks = realLines("feishu-real-clicks-p1-10.ndjson").map((l) => parseCardClick(JSON.parse(l), OWNER)!);
+  assert.deepEqual(clicks.map((c) => [c.card_id, c.option_index, c.text, c.scope]), [
+    ["C-16", 1, "验收加一条：pow(2, 10) 返回 1024", undefined],   // 目标卡：修改，带意见
+    ["C-17", 0, "", undefined],                                   // 目标卡：确认
+    ["C-18", 0, "", "task"],                                      // 普通决策卡：带适用范围
+    ["C-21", 0, "", undefined],                                   // 超预算卡：追加
+    ["C-22", 0, "", undefined],                                   // 审核卡：接受
+  ]);
+});
+
+test("目标卡正文各段之间空一行（飞书 markdown 不空行会把下一段标题接到上一条列表末尾）", async () => {
+  const { goalCardBody } = await import("../src/kernel/intake.ts");
+  const body = goalCardBody({ acceptance: ["a"], boundaries: ["b"], grant: { level: "L1", effects: [], budget: { runs: 8, minutes: 120 }, ask_first: [] } }, ["n"]);
+  assert.equal(body, "**提醒**\n- n\n\n**验收**\n- a\n\n**边界**\n- b\n\n**授权** L1 做到可审核为止 · 预算 8 轮或 2 小时 · 先问：不可逆或对外的动作");
 });

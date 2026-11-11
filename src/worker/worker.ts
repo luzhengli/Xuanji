@@ -1,8 +1,13 @@
 // 接单程序：领任务、起进程、心跳、停止、交回执。与内核同机，经本机接口连进来，自己保管凭据。
 import { parseReceipt } from "../kernel/receipt.ts";
-import { buildPrompt, buildResumePrompt } from "./context-pack.ts";
+import { parseDraft, type DraftResult } from "../kernel/intake.ts";
+import { runLimitMinutes } from "../kernel/budget.ts";
+import { buildPrompt, buildResumePrompt, buildIntakePrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
-import type { Goal, Receipt, Task } from "../kernel/types.ts";
+import type { Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
+
+// 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
+export const JUDGMENT_RUN_MS = 180_000;
 
 export interface ClaimResult {
   task: Task;
@@ -16,6 +21,7 @@ export interface ClaimResult {
 
 export interface KernelClient {
   claim(agent: string): Promise<ClaimResult | { task: null }>;
+  claimJudgment(agent: string): Promise<{ judgment: Judgment | null }>;
   emit(type: string, payload: Record<string, unknown>, about?: string): Promise<void>;
   goal(id: string): Promise<Goal>;
   runStatus(runId: string): Promise<string>;
@@ -61,6 +67,36 @@ export class Worker {
     return true;
   }
 
+  // 一次领判断点（P1-10 主理人）：起一次不给工具的 Agent，取最后一条消息里的目标卡草稿交回内核。
+  // 不接会话、不发心跳；格式错了在同一会话里请它重写一次，还不行就交错误，由内核重新排队或退回人手里。
+  async judgeOnce(agentName: string): Promise<boolean> {
+    const { judgment: j } = await this.kernel.claimJudgment(agentName);
+    if (!j) return false;
+    this.log(`${j.id} 领到主理人判断点（${j.about}）`);
+    let parsed: DraftResult = { ok: false, error: "没有运行" }, res: RunResult | null = null;
+    try {
+      const adapter = this.adapters[agentName];
+      if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
+      const profile = this.opts.profiles?.[agentName] ?? {};
+      const base = { cwd: this.workRoot, model: profile.model, permission_mode: profile.permission_mode, tools: [] as string[], timeout_ms: JUDGMENT_RUN_MS };
+      res = await adapter.run({ ...base, prompt: buildIntakePrompt(j.input), label: j.id });
+      if (res.rate_limit) await this.kernel.emit("quota.observed", { agent: agentName, ...res.rate_limit });
+      parsed = res.stopped ? { ok: false, error: "判断点超时" } : res.rate_limited ? { ok: false, error: "订阅额度限流" } : parseDraft(res.last_message);
+      if (!parsed.ok && res.session_id && !res.stopped && !res.rate_limited) {
+        this.log(`${j.id} 输出格式错误（${parsed.error}），请它重写`);
+        const retry = await adapter.run({ ...base, prompt: `输出格式错误：${parsed.error}。只重写最后一条消息为合法的 JSON 对象。`,
+          session_id: res.session_id, timeout_ms: 120_000, label: `${j.id}-rewrite` });
+        parsed = parseDraft(retry.last_message);
+      }
+    } catch (err) {
+      parsed = { ok: false, error: `接单程序出错：${(err as Error).message}`.slice(0, 300) };
+    }
+    await this.kernel.emit("judgment.result", { judgment_id: j.id, ...(parsed.ok ? { output: parsed.draft } : { error: parsed.error }),
+      session_id: res?.session_id ?? undefined, usage: res?.usage }, j.about);
+    this.log(`${j.id} 交结果：${parsed.ok ? `${parsed.draft.kind}${parsed.draft.direct ? "（直接立项）" : ""} ${parsed.draft.title || parsed.draft.reply}` : `失败 ${parsed.error}`}`);
+    return true;
+  }
+
   private async execute(agentName: string, a: ClaimResult): Promise<void> {
     const { task, run_id } = a;
     const adapter = this.adapters[agentName];
@@ -75,7 +111,7 @@ export class Worker {
       onSession: (id) => { session = id; beat().catch(() => {}); },
       cwd: task.workdir ?? this.workRoot,                         // TODO P2：每任务一个 worktree
       model: profile.model, permission_mode: profile.permission_mode,
-      timeout_ms: task.contract.budget.minutes * 60_000, label: run_id,
+      timeout_ms: runLimitMinutes(task) * 60_000, label: run_id,   // 剩下的时长预算（P1-13）
     };
     const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery }); // TODO P2：按范围匹配定论
 
@@ -114,7 +150,7 @@ export class Worker {
       this.log(`${run_id} 限流，等额度重置`);
       return;
     }
-    if (res.stopped) { await this.receipt(a, res, { outcome: "failed", summary: `单轮超时（${task.contract.budget.minutes} 分钟）` }); return; }
+    if (res.stopped) { await this.receipt(a, res, { outcome: "failed", summary: `单轮超时（本轮限时 ${Math.round(runLimitMinutes(task))} 分钟）` }); return; }
 
     let parsed = parseReceipt(res.last_message);
     if (!parsed.ok && res.session_id) {

@@ -29,6 +29,7 @@ export function kernelClient(base: string, source: EventSource, opts: ClientOpti
   return {
     get,
     claim: (agent) => post("/runs/claim", { agent, at: new Date().toISOString(), source_id: sourceId(), ...(opts.worker ?? {}) }),
+    claimJudgment: (agent) => post("/judgments/claim", { agent, at: new Date().toISOString(), source_id: sourceId(), ...(opts.worker ?? {}) }),
     emit: async (type, payload, about) => {
       const event = { source, source_id: sourceId(), type, at: new Date().toISOString(), about, payload };
       // 心跳丢一次无妨，下一次会补上；其余事件连不上内核就按间隔重试，来源编号不变。

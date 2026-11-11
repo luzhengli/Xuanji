@@ -12,5 +12,5 @@ const bootAt = new Date().toISOString();
 kernel.ingest({ source: "kernel", source_id: `restarted-${bootAt}`, type: "kernel.restarted", at: bootAt, payload: {} });
 startApi(kernel, cfg.port);
 // 定时器来源与内核同进程起，但它和别的来源一样经本机接口注入 timer.tick；内核本身仍不读时钟。
-startTimerSource(`http://127.0.0.1:${cfg.port}`, Number(process.env.XJ_TICK_MS ?? 60_000));
-console.log(`[kernel] 账本 ${cfg.db}，重放 ${n} 条事件，监听 127.0.0.1:${cfg.port}`);
+startTimerSource(`http://127.0.0.1:${cfg.port}`, Number(process.env.XJ_TICK_MS ?? 60_000), cfg.brief_at);
+console.log(`[kernel] 账本 ${cfg.db}，重放 ${n} 条事件，监听 127.0.0.1:${cfg.port}，每日简报 ${cfg.brief_at}`);

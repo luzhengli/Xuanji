@@ -1,33 +1,41 @@
 # 当前状态
 
-更新于 2026-11-12（飞书真实一轮通过）。每次收工时整份改写，不要追加。
+更新于 2026-11-12（第一批四项做完，飞书真实一轮通过）。每次收工时整份改写，不要追加。
 
 ## 现在在哪
 
-一期闭环已经经 `xj`（`5548993`）和飞书各真实跑通一轮，重启恢复与看门狗已做（`975c302`）。这次的飞书通道改动已按人的确认提交到本地 `main`。`npm test` 48 个通过，`npm run typecheck` 通过。
+一期闭环、重启恢复、看门狗、飞书通道已在前几次提交。这次做完第一批：P1-10 主理人、P1-13 预算、P1-17 每日简报加 P1-22 知会卡收起、P1-20 心跳折叠。`npm test` 86 个通过，`npm run typecheck` 通过。**改动还没提交**，等人点头。
 
-- **飞书通道（P1-09、P1-11）**：私聊一句话直接立项（人定，P1-10 主理人之前的过渡），回“已立项 G-x · T-x”。`/card`（卡片、待办）发来待处理的决策卡和审核卡，知会卡只列标题；`/status`（状态、进度）看全局；`/help`、`/goal`。决策卡主动推一次，审核卡不推。卡片整张是表单：文字框，决策卡另有适用范围和“用上面这句话回答”；回答后按账本原地改成结论。
-- **飞书真实一轮（人操作）**：div 走审核路径（G-6/T-6，C-12 接受）；greet2 走决策路径（G-7/T-7，C-13 推来后点“中文”，RN-12 以 `--resume` 接上 RN-11 的会话，C-14 接受）；`/status` 显示都 done。周用量 55%。
-- **录制件**：`test/fixtures/feishu-real-messages.ndjson`、`feishu-real-clicks.ndjson`（token 已打码）。真实事件证实：私聊文字的 `content` 是纯文本；表单按钮回调带 `action_name` 和 `form_value`（JSON 字符串），没有 `action_value`。
+- **主理人（P1-10）**：私聊一句话（或 `xj goal`）记为 `human.message`，内核记一个 `proposed` 目标、排一个判断点 J-x；接单程序另一个循环领判断点，起一次不给工具的 haiku（约 6 秒）。目标卡带提醒、验收、边界、授权，按钮是确认 / 修改 / 不做；修改意见写在文字框里。小而明确的初稿直接立项并推一条答复，不是目标的推一句回话。`xj goal --direct` 跳过主理人。
+- **预算（P1-13）**：时长只算 Agent 在跑的时间。任务回队列一律经 `requeue()` 查预算，超了转受阻，出超预算卡（追加 4 轮和 1 小时 / 停掉（推荐）/ 接管）。单轮限时取剩余的时长预算。
+- **简报（P1-17、P1-22）**：每天 09:00（`brief_at`）由定时器来源发 `brief.due`，来源编号是当天日期，内核只认一次。简报是推送的知会卡，汇总过的知会卡收起为 `folded`。`xj brief` 和飞书“简报”可以手动出一份。
+- **心跳折叠（P1-20）**：`xj why` 默认把连续心跳折成“心跳 N 次”，`--all` 全列。
+- **飞书真实一轮（人操作，2026-11-12 01:49 至 01:58）**：你好 → C-15 回话（G-8 abandoned）。pow → C-16 目标卡 → 文字框写字后点修改 → C-17 → 确认 → T-8 → C-18 问负指数 → 答“报错” → 预算 1 轮用完，出 C-21 → 追加 → RN-14 以 `--resume` 接上 RN-13 的会话 → C-22 接受。最后“简报”出 C-24，收起 8 张知会卡。之后修了目标卡各段之间的空行（飞书 markdown 不空行会粘连）和简报条目的长度。
+- **人新定的**：主理人答复和简报主动推送，人接受；周用量上限从 60% 改为 80%（配置、样例、设计文档都已改）。
 
 ## 下一步
 
-1. P1-10 主理人：把一句话整理成目标卡请人确认（替换现在的直接立项）；P1-13 预算。
-2. P1-22 知会卡收起；P1-15 备份、P1-16 部署、P1-17 简报；最后 P1-21 对外动作先落账（人定留在一期，排在这些之后）。
+1. 人确认后提交第一批（约定式提交，本地 `main`，不推送）。
+2. **第二批：运维，基本不用人在场**
+   - P1-15 备份：每小时快照、失败出卡片、每周恢复演练（在副本上重建核对，已手工做过三次，最近一次是这次的新旧代码对比）。
+   - P1-16 部署：launchd 随登录拉起三个进程，接单程序给固定的 `XJ_WORKER_NAME`。装进 launchd 会改人的系统登录项，装之前要人点头。
+3. **第三批：P1-21 对外动作先落账后执行**（排在最后、无人值守之前）。
+4. 新记的小项：P1-23 目标卡待确认时的补充被当成新目标；P1-24 任务停掉或接管后目标一直 active。
 
 ## 卡在哪
 
-- 文字框写了字再交的情形没在真实环境走过（机制已由真实事件证实，下次用到时顺带看一眼）。
-- Codex 订阅额度已用尽，11 月 14 日恢复；在那之前 GUI 操作做不了。
-- 尚未配置 Git 远端，提交只在本地。
+- 09:00 的自动简报还没在真实环境见过。三个进程现在开着（见下），到点应收到一张“简报 2026-11-12”；没收到就查 `/tmp/xj-real/logs/kernel.log` 和 `xj why 简报`。
+- 真实运行的两轮都只有 12 秒，没有连续心跳，折叠只有离线用例。
+- 周用量读数 58%（上限现为 80%）。
+- Codex 订阅额度 11 月 14 日恢复，在那之前做不了 GUI 操作。尚未配置 Git 远端。
 
 ## 接手须知
 
 - Node 24 直接跑 `.ts`，strip-only 模式不能用构造器参数属性、enum、namespace。
-- 三个进程：`npm run kernel`、`npm run worker`（`XJ_WORK_ROOT` 工作目录，`XJ_WORKER_NAME` 默认 `local`）、`npm run feishu`。`XJ_RECORD_DIR` 设了就录原始输出：接单程序录 Claude Code 的 stream-json，飞书通道录收到的事件。停飞书通道用 SIGTERM，lark-cli 提示 `kill -9` 可能在服务端留下订阅。
-- 内核只听 `127.0.0.1:7331`；`POST /events` 返回 `seq`、`duplicate`、`refs`（这条事件挂上的编号）；`GET /goals|tasks|runs|cards/:id`。领活要带 `agent`、`at`、`source_id`（接单程序再带 `worker`、`instance`）。
-- 飞书事件的来源编号：消息 `msg:<message_id>`，点击 `click:<event_id>`，送达 `delivered:<message_id>`；重投时内核去重。飞书卡片按钮名 `xj_C_<n>_o<序号>` / `xj_C_<n>_text`。
-- 看门狗阈值是归并里的常量（`HEARTBEAT_TIMEOUT_MS`、`RUN_GRACE_MS`），不在配置里。
-- 本机配置 `xuanji.config.json` 不入库，`claude` 档案写了 `model: claude-haiku-5-5`、`capacity: 1`；权限模式沿用本机 Claude Code 的 `auto`。
-- 一期所有任务共用沙盒工作目录 `/tmp/xj-real/work`，Agent 在分支 `feat/greet` 上提交。T-7 的目标没要求提交，所以 greet2 还是未提交的改动。
-- 内核启动时对账本跑 `rebuild()` 是人认可的行为（2026-11-12 定）；事件表只追加。
+- 三个进程：`npm run kernel`、`npm run worker`（`XJ_WORK_ROOT`、`XJ_WORKER_NAME` 默认 `local`、`XJ_RECORD_DIR`）、`npm run feishu`。现在是这样开着的：工作目录 `/tmp/xj-real/work`，录制到 `/tmp/xj-real/rec-1112b`，日志在 `/tmp/xj-real/logs/`。停飞书通道用 SIGTERM。
+- 内核只听 `127.0.0.1:7331`。新接口：`POST /judgments/claim`、`GET /judgments/:id`。卡片读出时带 `form` 和 `push`（要不要推送由内核算）。
+- 新事件类型：`human.message`、`judgment.claimed`、`judgment.result`、`brief.due`。新表 `judgments`，`cards` 加了 `form` 列（只加列）。
+- 判断点的阈值在归并里：`JUDGMENT_TIMEOUT_MS` 5 分钟；接单程序 3 分钟结束进程（`JUDGMENT_RUN_MS`）。连续失败 3 次按原话出目标卡。
+- Claude Code 即使 `--tools ""`，也把工作目录的 git 状态放进系统提示词，主理人能看到仓库状态。
+- 沙盒仓库 `/tmp/xj-real/work` 里 `math.mjs` 有未提交的 greet2 和 pow 改动（T-7、T-8 的目标都没要求提交）。
+- 内核启动时对账本跑 `rebuild()` 是人认可的行为；事件表只追加。

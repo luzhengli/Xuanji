@@ -77,7 +77,10 @@ test("看门狗：一直有心跳但超过预算时长加宽限，判单轮超�
   beat(k, c.run_id, at(budget + RUN_GRACE_MS + 1_000));
   tick(k, at(budget + RUN_GRACE_MS + 1_000));
   assert.equal(k.run(c.run_id)!.status, "lost");
-  assert.match(k.run(c.run_id)!.lost_reason!, /单轮超时（预算 120 分钟）/);
+  assert.match(k.run(c.run_id)!.lost_reason!, /单轮超时（本轮限时 120 分钟）/);
+  // 这一轮跑了 125 分钟，时长预算已经用完：不再带恢复说明回队列，转受阻出超预算卡（P1-13）
+  assert.equal(k.task("T-1")!.state, "blocked");
+  assert.match(k.cards()[0]!.title, /^超出预算：已用 125 分钟（预算 120 分钟）/);
 });
 
 test("内核重启：从账本重建，执行中的轮次不立即判中断，给一个心跳超时的宽限", () => {

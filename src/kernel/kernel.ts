@@ -2,13 +2,13 @@
 // ingest() 是唯一入口：追加事件、归并投影、对账，三者同一事务。
 import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
-import { reduce, getGoal, getTask } from "./reducer.ts";
+import { reduce, getGoal, getTask, getJudgment } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
 import { pickNext } from "./scheduler.ts";
-import { openCards } from "./attention.ts";
+import { openCards, rowToCard } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
-import type { Card, Event, EventInput, Receipt, Run, Task, TaskState } from "./types.ts";
+import type { Card, Event, EventInput, Judgment, Receipt, Run, Task, TaskState } from "./types.ts";
 
 // 领活的结果：一件任务、内核签发的轮次编号，以及这一轮要带上的反馈和上一轮回执。
 export interface Claim {
@@ -71,6 +71,21 @@ export class Kernel {
     });
   }
 
+  // 领判断点（P1-10 主理人）：和领活分开，判断点不占执行的并发名额，也不受背压和额度挡，
+  // 因为它是人刚说的话、不给工具、几十秒就结束；否则人发一句话要等正在跑的长任务做完才有回音。
+  claimJudgment(agent: string, at: string, source_id: string, who?: WorkerIdentity): Judgment | null {
+    return transaction(this.db, () => {
+      if (!this.cfg.agents[agent]?.kinds.includes("judge")) return null;
+      const next = this.db.prepare(`SELECT id, about FROM judgments WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1`).get() as { id: string; about: string } | undefined;
+      if (!next) return null;
+      const e = this.apply({ source: "worker", source_id, type: "judgment.claimed", at, about: next.about,
+        payload: { judgment_id: next.id, agent, ...(who ?? {}) } });
+      if (!e) return null;
+      return getJudgment(this.db, next.id) ?? null;
+    });
+  }
+  judgment(id: string) { return getJudgment(this.db, id) ?? null; }
+
   private lastReceipt(taskId: string): Receipt | null {
     const r = this.db.prepare(`SELECT receipt FROM runs WHERE task_id = ? AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { receipt: string } | undefined;
     return r ? JSON.parse(r.receipt) : null;
@@ -80,7 +95,7 @@ export class Kernel {
   // 单张卡片，不论是否已回答。飞书点击后据此把卡片原地改成账本里记下的结论。
   card(id: string): Card | null {
     const r = this.db.prepare(`SELECT * FROM cards WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
-    return r ? { ...(r as unknown as Card), options: JSON.parse(r.options as string), answer: r.answer ? JSON.parse(r.answer as string) : null } : null;
+    return r ? rowToCard(r) : null;
   }
   // 一条事件挂上的编号，含它签发的（立项事件 → G-x、T-x）。
   refsOf(seq: number): string[] {

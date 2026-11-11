@@ -21,9 +21,10 @@ export interface Config {
   port: number;               // 内核只听 127.0.0.1
   owner_open_id: string;      // 只认你本人（飞书 open_id）
   backup_dir: string;         // 快照目录（首版在系统盘）
+  brief_at: string;           // 每日简报的本机时间 HH:MM（人定 2026-11-12：09:00）
   limits: {
     backpressure_cards: number;      // 待处理决策卡+审核卡上限，默认 5
-    weekly_quota_ratio: number;      // 自动化不超过订阅周限额的比例，默认 0.6
+    weekly_quota_ratio: number;      // 自动化不超过订阅周限额的比例，默认 0.8（人定 2026-11-12，原为 0.6）
     per_goal_concurrency: number;
     hop_limit: number;               // 跳数熔断，默认 8
   };
@@ -35,7 +36,8 @@ export const DEFAULTS: Config = {
   port: 7331,
   owner_open_id: "",
   backup_dir: "./data/backups",
-  limits: { backpressure_cards: 5, weekly_quota_ratio: 0.6, per_goal_concurrency: 2, hop_limit: 8 },
+  brief_at: "09:00",
+  limits: { backpressure_cards: 5, weekly_quota_ratio: 0.8, per_goal_concurrency: 2, hop_limit: 8 },
   agents: {
     claude: { use: "claude", kinds: ["code", "plan", "write", "judge"], tier: "strong", billing: "subscription", capacity: 2 },
   },

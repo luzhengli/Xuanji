@@ -16,18 +16,24 @@ const workRoot = process.env.XJ_WORK_ROOT ?? process.cwd();
 const worker = new Worker(client, { claude: new ClaudeCodeAdapter({ recordDir: process.env.XJ_RECORD_DIR, pidDir }) }, workRoot,
   { profiles: cfg.agents, identity, reap: () => reapOrphans(pidDir) });
 const POLL_MS = 5_000;
+const JUDGE_POLL_MS = 2_000;   // 主理人是人刚说的话，领得勤一些
 console.log(`[worker] ${identity.worker}（${identity.instance}）工作目录 ${workRoot}，档案 ${Object.entries(cfg.agents).map(([k, v]) => `${k}${v.model ? `(${v.model})` : ""}`).join(", ")}`);
 
-async function loop() {
-  for (;;) {   // 内核可能比接单程序晚起：报到不成功就等一会儿再试，不能跳过报到直接领活
-    try { await worker.start(); break; } catch (e) { console.error("[worker] 报到失败，5 秒后重试：", (e as Error).message); await new Promise((r) => setTimeout(r, POLL_MS)); }
-  }
+// 执行和判断点各一个循环，互不等待：执行一轮可能跑两小时，人这时说一句话，主理人照样马上整理。
+async function poll(name: string, once: (agent: string) => Promise<boolean>, idleMs: number): Promise<never> {
   for (;;) {
     let did = false;
     for (const agent of Object.keys(cfg.agents)) {
-      try { did = (await worker.once(agent)) || did; } catch (e) { console.error("[worker]", (e as Error).message); }
+      try { did = (await once(agent)) || did; } catch (e) { console.error(`[worker] ${name}`, (e as Error).message); }
     }
-    if (!did) await new Promise((r) => setTimeout(r, POLL_MS));
+    if (!did) await new Promise((r) => setTimeout(r, idleMs));
   }
 }
-loop();
+
+async function main() {
+  for (;;) {   // 内核可能比接单程序晚起：报到不成功就等一会儿再试，不能跳过报到直接领活
+    try { await worker.start(); break; } catch (e) { console.error("[worker] 报到失败，5 秒后重试：", (e as Error).message); await new Promise((r) => setTimeout(r, POLL_MS)); }
+  }
+  await Promise.all([poll("执行", (a) => worker.once(a), POLL_MS), poll("判断点", (a) => worker.judgeOnce(a), JUDGE_POLL_MS)]);
+}
+main();

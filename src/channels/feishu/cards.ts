@@ -21,14 +21,19 @@ export function parseButtonName(name: string): { card_id: string; option_index?:
   return m[2] === undefined ? { card_id: `C-${m[1]}` } : { card_id: `C-${m[1]}`, option_index: Number(m[2]) };
 }
 
+// 文字框的提示语：目标卡写修改意见，超预算卡写给下一轮的话，决策卡是选项之外的回答，审核卡是退回或接管的意见。
+const PLACEHOLDER = (card: Card): string =>
+  card.form === "goal" ? "要改什么写在这里，再点“修改”"
+    : card.form === "budget" ? "追加时想交代下一轮的话（可选）"
+      : card.kind === "decision" ? "选项都不合适时写一句话（可选）" : "退回或接管时写意见（可选）";
+
 export function renderCard(card: Card): Record<string, unknown> {
   const elements: unknown[] = [{ tag: "markdown", content: card.body || "（无正文）" }];
   if (card.kind !== "notice") {
-    const form: unknown[] = [{
-      tag: "input", name: "text", max_length: 500,
-      placeholder: { tag: "plain_text", content: card.kind === "decision" ? "选项都不合适时写一句话（可选）" : "退回或接管时写意见（可选）" },
-    }];
-    if (card.kind === "decision") {
+    // 目标卡和超预算卡的回答就是按钮本身，不落成定论，所以没有适用范围，也没有“用这句话回答”。
+    const plainDecision = card.kind === "decision" && !card.form;
+    const form: unknown[] = [{ tag: "input", name: "text", max_length: 500, placeholder: { tag: "plain_text", content: PLACEHOLDER(card) } }];
+    if (plainDecision) {
       form.push({ tag: "select_static", name: "scope", initial_option: "task",
         placeholder: { tag: "plain_text", content: "适用范围" },
         options: SCOPES.map((s) => ({ text: { tag: "plain_text", content: s.label }, value: s.value })) });
@@ -37,7 +42,7 @@ export function renderCard(card: Card): Record<string, unknown> {
       tag: "button", name: nameOf(card.id, `o${i}`), form_action_type: "submit",
       text: { tag: "plain_text", content: o.recommended ? `${o.label}（推荐）` : o.label }, type: o.recommended ? "primary" : "default",
     }));
-    if (card.kind === "decision") {
+    if (plainDecision) {
       form.push({ tag: "button", name: nameOf(card.id, "text"), form_action_type: "submit",
         text: { tag: "plain_text", content: "用上面这句话回答" }, type: "default" });
     }

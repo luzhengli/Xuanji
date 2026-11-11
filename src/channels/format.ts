@@ -1,5 +1,5 @@
 // 入口共用的文字格式：xj 和飞书通道用同一套写法说状态和卡片。
-import type { Card } from "../kernel/types.ts";
+import type { Card, Event } from "../kernel/types.ts";
 
 export const WAITING = { human: "等人", agent: "等 Agent", world: "等世界", none: "不再等" } as const;
 export const CARD_KIND = { decision: "决策", review: "审核", notice: "知会" } as const;
@@ -31,7 +31,7 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
   const done = o.goals.filter((g) => g.status === "done" || g.status === "abandoned");
   const shownDone = opts.doneLimit === undefined ? done : done.slice(-opts.doneLimit);
   for (const g of [...shownDone, ...active]) {
-    out.push(`${g.id} [${g.status}] ${g.title}`);
+    out.push(`${g.id} [${g.status}] ${g.title}${g.status === "proposed" ? "（主理人整理中，或目标卡等你确认）" : ""}`);
     for (const t of o.tasks.filter((x) => x.goal_id === g.id)) out.push(`  ${t.id} [${t.state}] ${WAITING[t.waiting_on]} · 已跑 ${t.runs_used} 轮`);
   }
   if (shownDone.length < done.length) out.push(`（另有 ${done.length - shownDone.length} 个已结束的目标未列出）`);
@@ -40,4 +40,27 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
     out.push(`额度 ${q.agent}：周 ${pct(q.seven_day_utilization)}，5 小时 ${pct(q.five_hour_utilization)}`);
   }
   return out.join("\n");
+}
+
+// xj why 的默认视图（P1-20）：长任务每 30 秒一条心跳，连续的心跳折成一行“心跳 N 次”，别的事件原样保留。
+export type WhyItem = { kind: "event"; event: Event } | { kind: "beats"; first: Event; last: Event; count: number; runs: string[] };
+
+export function foldHeartbeats(events: Event[]): WhyItem[] {
+  const out: WhyItem[] = [];
+  for (const e of events) {
+    const prev = out.at(-1);
+    if (e.type === "run.heartbeat" && !e.note) {
+      const run = String((e.payload as { run_id?: unknown }).run_id ?? "");
+      if (prev?.kind === "beats") {
+        prev.last = e; prev.count++;
+        if (run && !prev.runs.includes(run)) prev.runs.push(run);
+        continue;
+      }
+      out.push({ kind: "beats", first: e, last: e, count: 1, runs: run ? [run] : [] });
+      continue;
+    }
+    out.push({ kind: "event", event: e });
+  }
+  // 单独一次心跳不必折
+  return out.map((x) => (x.kind === "beats" && x.count === 1 ? { kind: "event", event: x.first } : x));
 }
