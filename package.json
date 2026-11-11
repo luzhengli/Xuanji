@@ -1,0 +1,22 @@
+{
+  "name": "xuanji",
+  "version": "0.1.0",
+  "private": true,
+  "description": "璇玑：多 Agent 并行协调系统。一个确定性内核加一个 SQLite 文件。",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "bin": { "xj": "./bin/xj.js" },
+  "scripts": {
+    "kernel": "node src/kernel/main.ts",
+    "worker": "node src/worker/main.ts",
+    "feishu": "node src/channels/feishu/main.ts",
+    "xj": "node src/channels/cli/xj.ts",
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5.9"
+  }
+}

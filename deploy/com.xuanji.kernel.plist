@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P1-16：随登录拉起，以登录用户身份运行，这样 Agent 才能用到已有登录态。安装：cp 到 ~/Library/LaunchAgents 后 launchctl load。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.xuanji.kernel</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/node</string><string>src/kernel/main.ts</string></array>
+  <key>WorkingDirectory</key><string>/Users/me/Project/Xuanji</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/me/Project/Xuanji/data/logs/kernel.log</string>
+  <key>StandardErrorPath</key><string>/Users/me/Project/Xuanji/data/logs/kernel.err</string>
+</dict></plist>

@@ -4,6 +4,19 @@
 
 ---
 
+## 2026-11-11 提交一期代码框架
+
+- 按人的要求，将一期代码框架、测试、配置样例、部署模板及配套设计与进展文档纳入 `feat(core)` 约定式提交。
+- 提交前复跑 `npm test`（10 个通过）和 `npm run typecheck`（通过），补充真实配置 `xuanji.config.json` 的忽略规则。
+- 同步交接状态与待办；S1 卡片点击、真实进程闭环及已有 TODO 仍待完成，尚未配置远端。
+
+## 2026-11-11 实测 S1–S3，搭起代码框架
+
+- 确认当前机器就是 Mac mini。S2 通过：无界面一轮拿到回执和会话编号，`--resume` 续接成功。S3 结论反转：状态栏脚本无界面时不被调用，但 `stream-json` 里的 `rate_limit_event` 直接给周用量，设计文档改为这条路。
+- S1 一半：消息接收经长连接已通；卡片点击需在开发者后台订阅 `card.action.trigger`（lark-cli 给的订阅链接：`https://open.feishu.cn/page/launcher?clientID=cli_0000000000000000&addons=H4sIAAAAAAAA_6pWSk7MyUlKTM4uVrKqVsosSc0tVrKKVkpOLErRS0wuyczP0yspykxPTy1Siq2tBQQAAP__he-Iai8AAAA`）。探针卡已发到私聊。
+- 代码框架：`src/{kernel,worker,channels,sources}`、`test/`（10 个通过）、`deploy/`、`scripts/backup.ts`，零运行时依赖，`tsc` 干净。`xj goal` 立项、重启重建账本手工跑通。
+- 没做：三个进程没有串起来跑真实一轮；S1 点击未收到；未提交。
+
 ## 2026-11-11 初始化 Git 并创建约定式提交
 
 - 初始化本地 Git 仓库，默认分支为 `main`，首次提交采用 `chore(repo): ...` 格式。

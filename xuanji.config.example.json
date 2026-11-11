@@ -1,0 +1,10 @@
+{
+  "db": "./data/xuanji.db",
+  "port": 7331,
+  "owner_open_id": "ou_xxx",
+  "backup_dir": "./data/backups",
+  "limits": { "backpressure_cards": 5, "weekly_quota_ratio": 0.6, "per_goal_concurrency": 2, "hop_limit": 8 },
+  "agents": {
+    "claude": { "use": "claude", "kinds": ["code", "plan", "write", "judge"], "tier": "strong", "billing": "subscription", "capacity": 2 }
+  }
+}
