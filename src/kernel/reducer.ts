@@ -26,6 +26,8 @@ export const HEARTBEAT_TIMEOUT_MS = 180_000;
 export const RUN_GRACE_MS = 300_000;
 // 判断点不给工具、不发心跳，接单程序 3 分钟结束进程；内核这里 5 分钟没结果就判失败，重新排队。
 export const JUDGMENT_TIMEOUT_MS = 300_000;
+// 备份每小时一次；最近一次成功超过 3 小时（连着 3 次没成）就出异常卡。
+export const BACKUP_STALE_MS = 3 * 3_600_000;
 
 // 目标卡的三个按钮（人定 2026-11-12：确认 / 修改 / 不做，文字框写修改意见）。
 export const GOAL_OPTIONS: CardOption[] = [
@@ -72,6 +74,26 @@ export const handlers: Record<string, Handler> = {
     if (!d.ok) { judgmentFailed(db, e, j, d.error); return; }
     db.prepare(`UPDATE judgments SET status = 'finished', finished_at = ?, error = NULL WHERE id = ?`).run(e.at, j.id);
     if (j.kind === "intake") onIntake(db, e, j, d.draft);
+  },
+
+  // 备份（P1-15）：备份来源报来的结果。成功就撤回还开着的异常卡，失败出异常卡（推送）。
+  "backup.done": (db, e) => {
+    const p = e.payload as { path: string; bytes: number };
+    putBackup(db, "snapshot", true, e.at, `${p.path}（${p.bytes} 字节）`);
+    withdrawAlert(db, e, "alert:backup", "备份恢复正常");
+  },
+  "backup.failed": (db, e) => {
+    const p = e.payload as { error: string };
+    putBackup(db, "snapshot", false, e.at, p.error);
+    alert(db, e, "alert:backup", "备份失败", `${p.error}\n${lastBackupLine(db, e.at)}。账本没有快照就防不了误操作和文件损坏，请看内核日志。`);
+  },
+  "backup.drilled": (db, e) => {
+    const p = e.payload as { ok: boolean; snapshot: string; events: number; integrity: string; mismatches: string[] };
+    const detail = p.ok ? `${p.snapshot}：完整性 ok，重放 ${p.events} 条事件，投影一致`
+      : `${p.snapshot}：完整性 ${p.integrity || "未检查"}；${p.mismatches.join("；") || "没有比对结果"}`;
+    putBackup(db, "drill", p.ok, e.at, detail);
+    if (p.ok) withdrawAlert(db, e, "alert:drill", "恢复演练通过");
+    else alert(db, e, "alert:drill", "恢复演练没通过", `${detail}\n快照可能恢复不出现在的状态，或者重放结果和在线投影不一致。`);
   },
 
   // 每日简报（P1-17），兼作心跳；汇总过的知会卡收起（P1-22）。定时器来源每天到点发一次，人也可以手动要。
@@ -211,6 +233,7 @@ export const handlers: Record<string, Handler> = {
       requeue(db, e, task.id, `定时器到点（${t.due_at}），回队列`);
     }
     watchdog(db, e);
+    backupWatch(db, e);
   },
 
   // 人回答了卡片：回答本身是一条事件；回答落成定论；任务接上，回答作为下一轮的反馈。
@@ -407,7 +430,7 @@ function reviewBody(r: Receipt): string {
 }
 
 // 卡片正文的长度上限，细节放证据链接。目标卡和简报要列几条，放宽一些。
-const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, goal: 900, reply: 900, brief: 1500 };
+const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, alert: 600, goal: 900, reply: 900, brief: 1500 };
 
 function createCard(db: DB, e: Event, kind: CardKind, about: string, title: string, body: string, options: CardOption[], dedupeKey: string,
   form: CardForm | null = null): string | null {
@@ -591,6 +614,51 @@ function answerGoalCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void {
   }
 }
 
+// ---- 备份（P1-15）----
+function putBackup(db: DB, kind: "snapshot" | "drill", ok: boolean, at: string, detail: string): void {
+  db.prepare(`INSERT INTO backups VALUES (?, ?, ?, ?) ON CONFLICT(kind, ok) DO UPDATE SET at = excluded.at, detail = excluded.detail`).run(kind, ok ? 1 : 0, at, detail);
+}
+
+export function backupStatus(db: DB): { snapshot_ok_at: string | null; snapshot_failed_at: string | null; drill_ok_at: string | null; drill_failed_at: string | null; snapshot: string | null; drill: string | null } {
+  const rows = db.prepare(`SELECT kind, ok, at, detail FROM backups`).all() as { kind: string; ok: number; at: string; detail: string }[];
+  const get = (kind: string, ok: number) => rows.find((r) => r.kind === kind && r.ok === ok);
+  const latest = (kind: string) => [get(kind, 1), get(kind, 0)].filter(Boolean).sort((a, b) => a!.at.localeCompare(b!.at)).at(-1);
+  const line = (kind: string) => { const r = latest(kind); return r ? `${r.ok ? "成功" : "失败"}：${r.detail}` : null; };
+  return { snapshot_ok_at: get("snapshot", 1)?.at ?? null, snapshot_failed_at: get("snapshot", 0)?.at ?? null,
+    drill_ok_at: get("drill", 1)?.at ?? null, drill_failed_at: get("drill", 0)?.at ?? null, snapshot: line("snapshot"), drill: line("drill") };
+}
+
+// 相对时长的说法，只拿两个事件时间相减，不读时钟。
+function ago(at: string, now: string): string {
+  const m = Math.max(0, Math.round((Date.parse(now) - Date.parse(at)) / 60_000));
+  return m < 60 ? `${m} 分钟前` : m < 2880 ? `${Math.round(m / 60)} 小时前` : `${Math.round(m / 1440)} 天前`;
+}
+
+function lastBackupLine(db: DB, now: string): string {
+  const s = backupStatus(db);
+  return s.snapshot_ok_at ? `最近一次成功是 ${ago(s.snapshot_ok_at, now)}` : "还没有成功过";
+}
+
+// 每次 tick 看一眼：最近一次成功的备份太旧，说明备份来源停了或一直在失败。
+function backupWatch(db: DB, e: Event): void {
+  const s = backupStatus(db);
+  if (!s.snapshot_ok_at || Date.parse(e.at) - Date.parse(s.snapshot_ok_at) <= BACKUP_STALE_MS) return;
+  alert(db, e, "alert:backup", "备份超过 3 小时没有成功", `${lastBackupLine(db, e.at)}。备份每小时一次，看内核日志里的 [backup]。`);
+}
+
+function alert(db: DB, e: Event, key: string, title: string, body: string): void {
+  const id = createCard(db, e, "notice", "备份", title, body, [], key, "alert");
+  if (id) link(db, e.seq, id, title);
+}
+
+function withdrawAlert(db: DB, e: Event, key: string, why: string): void {
+  const open = db.prepare(`SELECT id FROM cards WHERE dedupe_key = ? AND status = 'open'`).all(key) as { id: string }[];
+  for (const c of open) {
+    db.prepare(`UPDATE cards SET status = 'withdrawn', updated_at = ? WHERE id = ?`).run(e.at, c.id);
+    link(db, e.seq, c.id, `${why}，撤回`);
+  }
+}
+
 // ---- 每日简报（P1-17）与知会卡收起（P1-22）----
 // 简报本身是一张知会卡，内核从账本现算：要你处理的卡片、上次简报以来完成的任务、在做的事、知会、额度。
 // 汇总过的知会卡（含上一份简报）收起，不再出现在 /card 和 /status 里。
@@ -619,6 +687,11 @@ function brief(db: DB, e: Event): void {
   lines.push(`**在做**：${busy.length ? busy.map(([w, n]) => `${{ agent: "等 Agent", world: "等世界", human: "等人" }[w]} ${n}`).join(" · ") : "没有"}`);
   if (notices.length) lines.push(`**知会** ${notices.length} 条（已收起）`, ...list(notices.map((c) => `${c.id} ${c.title}`)));
   for (const q of quota) if (q.u != null) lines.push(`**额度** ${q.agent} 周用量 ${Math.round(q.u * 100)}%`);
+  const bs = backupStatus(db);
+  if (bs.snapshot_ok_at || bs.snapshot_failed_at) {
+    lines.push(`**备份** ${bs.snapshot_ok_at ? `最近成功 ${ago(bs.snapshot_ok_at, e.at)}` : "还没有成功过"}` +
+      `${bs.drill_ok_at ? `；恢复演练 ${ago(bs.drill_ok_at, e.at)}通过` : "；还没演练通过"}`);
+  }
 
   const id = createCard(db, e, "notice", "简报", `简报 ${date}`, lines.join("\n"), [], `brief:${e.seq}`, "brief");
   const folded = db.prepare(`SELECT id FROM cards WHERE status = 'open' AND kind = 'notice' AND id IS NOT ?`).all(id) as { id: string }[];

@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS judgments (
   session_id TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS judgments_status ON judgments(status);
+-- 备份（P1-15）：快照和恢复演练各记最近一次成功、最近一次失败。
+CREATE TABLE IF NOT EXISTS backups (
+  kind TEXT NOT NULL, ok INTEGER NOT NULL, at TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY (kind, ok)
+);
 CREATE TABLE IF NOT EXISTS quota (
   agent TEXT PRIMARY KEY, seven_day_utilization REAL, seven_day_resets_at TEXT,
   five_hour_utilization REAL, five_hour_resets_at TEXT, observed_at TEXT
@@ -113,7 +117,7 @@ export function nextId(db: DB, name: string): number {
 
 // 投影可以从事件日志重建：清空所有投影表，不动 events。
 export function clearProjections(db: DB): void {
-  for (const t of ["event_refs", "judgments", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
+  for (const t of ["event_refs", "judgments", "backups", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
     db.exec(`DELETE FROM ${t}`);
   }
 }

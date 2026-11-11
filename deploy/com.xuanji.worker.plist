@@ -1,11 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- P1-16：随登录拉起，以登录用户身份运行，这样 Agent 才能用到已有登录态。安装：cp 到 ~/Library/LaunchAgents 后 launchctl load。 -->
+<!-- P1-16：随登录拉起，以登录用户身份运行，这样 Agent 才能用到已有登录态。
+     这是模板：__NODE__ 等占位符由 scripts/launchd.ts 在安装时填上，不要直接拷进 ~/Library/LaunchAgents。 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.xuanji.worker</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/node</string><string>src/worker/main.ts</string></array>
-  <key>WorkingDirectory</key><string>/Users/me/Project/Xuanji</string>
-  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/me/Project/Xuanji/data/logs/worker.log</string>
-  <key>StandardErrorPath</key><string>/Users/me/Project/Xuanji/data/logs/worker.err</string>
+  <key>ProgramArguments</key><array><string>__NODE__</string><string>src/worker/main.ts</string></array>
+  <key>WorkingDirectory</key><string>__REPO__</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>__PATH__</string>
+    <key>XJ_WORKER_NAME</key><string>local</string>
+    <key>XJ_WORK_ROOT</key><string>__WORK_ROOT__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__REPO__/data/logs/worker.log</string>
+  <key>StandardErrorPath</key><string>__REPO__/data/logs/worker.err</string>
 </dict></plist>

@@ -2,7 +2,7 @@
 // ingest() 是唯一入口：追加事件、归并投影、对账，三者同一事务。
 import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
-import { reduce, getGoal, getTask, getJudgment } from "./reducer.ts";
+import { reduce, getGoal, getTask, getJudgment, backupStatus } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
 import { pickNext } from "./scheduler.ts";
 import { openCards, rowToCard } from "./attention.ts";
@@ -85,6 +85,7 @@ export class Kernel {
     });
   }
   judgment(id: string) { return getJudgment(this.db, id) ?? null; }
+  backups() { return backupStatus(this.db); }
 
   private lastReceipt(taskId: string): Receipt | null {
     const r = this.db.prepare(`SELECT receipt FROM runs WHERE task_id = ? AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { receipt: string } | undefined;
@@ -115,7 +116,7 @@ export class Kernel {
     const goals = this.db.prepare(`SELECT id, title, status FROM goals ORDER BY created_at, rowid`).all();
     const runs = this.db.prepare(`SELECT id, task_id, agent, status, session_id, started_at, finished_at FROM runs ORDER BY rowid`).all();
     const quota = this.db.prepare(`SELECT * FROM quota`).all();
-    return { goals, tasks, runs, cards: this.cards(), quota };
+    return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups() };
   }
 
   close() { this.db.close(); }

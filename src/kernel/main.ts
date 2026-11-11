@@ -3,6 +3,7 @@ import { loadConfig } from "../shared/config.ts";
 import { Kernel } from "./kernel.ts";
 import { startApi } from "./api.ts";
 import { startTimerSource } from "../sources/timer.ts";
+import { startBackupSource } from "../ops/backup.ts";
 
 const cfg = loadConfig();
 const kernel = new Kernel(cfg);
@@ -13,4 +14,7 @@ kernel.ingest({ source: "kernel", source_id: `restarted-${bootAt}`, type: "kerne
 startApi(kernel, cfg.port);
 // 定时器来源与内核同进程起，但它和别的来源一样经本机接口注入 timer.tick；内核本身仍不读时钟。
 startTimerSource(`http://127.0.0.1:${cfg.port}`, Number(process.env.XJ_TICK_MS ?? 60_000), cfg.brief_at);
-console.log(`[kernel] 账本 ${cfg.db}，重放 ${n} 条事件，监听 127.0.0.1:${cfg.port}，每日简报 ${cfg.brief_at}`);
+// 备份来源（P1-15）同样在内核进程里起、经本机接口报结果。XJ_BACKUP_MS=0 关掉（测试或临时账本用）。
+const backupMs = Number(process.env.XJ_BACKUP_MS ?? 3_600_000);
+if (backupMs > 0) startBackupSource(`http://127.0.0.1:${cfg.port}`, cfg, backupMs);
+console.log(`[kernel] 账本 ${cfg.db}，重放 ${n} 条事件，监听 127.0.0.1:${cfg.port}，每日简报 ${cfg.brief_at}，备份到 ${cfg.backup_dir}${backupMs > 0 ? `（每 ${Math.round(backupMs / 60_000)} 分钟）` : "（已关）"}`);

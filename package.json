@@ -11,6 +11,8 @@
     "worker": "node src/worker/main.ts",
     "feishu": "node src/channels/feishu/main.ts",
     "xj": "node src/channels/cli/xj.ts",
+    "backup": "node scripts/backup.ts",
+    "restore": "node scripts/restore.ts",
     "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },

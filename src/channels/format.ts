@@ -9,7 +9,24 @@ export type Overview = {
   tasks: { id: string; goal_id: string; state: string; runs_used: number; waiting_on: keyof typeof WAITING; session_id: string | null }[];
   cards: Card[];
   quota: { agent: string; seven_day_utilization: number | null; five_hour_utilization: number | null }[];
+  backup?: { snapshot_ok_at: string | null; snapshot_failed_at: string | null; drill_ok_at: string | null; drill_failed_at: string | null } | undefined;
 };
+
+// 多久以前。入口是客户端，可以读时钟；内核里同样的说法只拿事件时间相减。
+export function since(at: string, now: Date): string {
+  const m = Math.max(0, Math.round((now.getTime() - Date.parse(at)) / 60_000));
+  return m < 60 ? `${m} 分钟前` : m < 2880 ? `${Math.round(m / 60)} 小时前` : `${Math.round(m / 1440)} 天前`;
+}
+
+// 备份一行（P1-15）：最近一次成功的快照、最近一次演练；最近一次是失败的照实说。
+export function showBackup(b: NonNullable<Overview["backup"]>, now: Date): string | null {
+  if (!b.snapshot_ok_at && !b.snapshot_failed_at) return null;
+  const failedLast = b.snapshot_failed_at && (!b.snapshot_ok_at || b.snapshot_failed_at > b.snapshot_ok_at);
+  const snap = b.snapshot_ok_at ? `最近成功 ${since(b.snapshot_ok_at, now)}` : "还没有成功过";
+  const drillFailedLast = b.drill_failed_at && (!b.drill_ok_at || b.drill_failed_at > b.drill_ok_at);
+  const drill = drillFailedLast ? `恢复演练 ${since(b.drill_failed_at!, now)}没通过` : b.drill_ok_at ? `恢复演练 ${since(b.drill_ok_at, now)}通过` : "还没演练";
+  return `备份：${snap}${failedLast ? `（${since(b.snapshot_failed_at!, now)}失败过一次）` : ""}；${drill}`;
+}
 
 export function showCard(c: Card): string {
   const opts = c.options.map((o) => `${o.key}${o.recommended ? "（推荐）" : ""}`).join(" / ");
@@ -23,7 +40,7 @@ export function splitCards(cards: Card[]): { need: Card[]; fyi: Card[] } {
 }
 
 // 看全局：默认只回答“现在有什么需要我”，再按目标列任务在等谁。done 的目标只留最近几个，健康的状态不占地方。
-export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: number } = { cardsHint: "xj cards" }): string {
+export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: number; now?: Date } = { cardsHint: "xj cards" }): string {
   const out: string[] = [];
   const { need, fyi } = splitCards(o.cards);
   out.push(`需要你：${need.length ? `${need.length} 张卡片（${opts.cardsHint}）` : "没有"}${fyi.length ? `；另有 ${fyi.length} 张知会卡` : ""}`);
@@ -39,6 +56,8 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
     const pct = (x: number | null) => (x == null ? "?" : `${Math.round(x * 100)}%`);
     out.push(`额度 ${q.agent}：周 ${pct(q.seven_day_utilization)}，5 小时 ${pct(q.five_hour_utilization)}`);
   }
+  const b = o.backup && showBackup(o.backup, opts.now ?? new Date());
+  if (b) out.push(b);
   return out.join("\n");
 }
 

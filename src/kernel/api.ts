@@ -27,6 +27,7 @@ export function startApi(kernel: Kernel, port: number) {
         const j = kernel.claimJudgment(b.agent, b.at, b.source_id, b.worker && b.instance ? { worker: b.worker, instance: b.instance } : undefined);
         return json(res, 200, { judgment: j });
       }
+      if (route === "GET /backups") return json(res, 200, kernel.backups());
       if (route === "GET /cards") return json(res, 200, kernel.cards());
       if (route === "GET /overview") return json(res, 200, kernel.overview());
       const one = /^GET \/(goals|tasks|runs|cards|judgments)\/([^/]+)$/.exec(route);

@@ -1,20 +1,19 @@
-// P1-15 备份：每小时用 SQLite 在线备份生成一致快照，保留 48 份；失败出异常卡；每周演练恢复。
-// 不直接拷贝正在写的数据库文件。
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+// 手动备份一次（P1-15）。平时由内核进程里的备份来源每小时自动做，这个脚本用于手动补一份或强制演练：
+//   node scripts/backup.ts           拍一份快照；上次演练通过已超过 7 天就顺带演练
+//   node scripts/backup.ts --drill   拍一份快照并强制演练
+// 内核在跑就把结果报成事件（xj status 能看到），不在跑只打印。
 import { loadConfig } from "../src/shared/config.ts";
+import { backupOnce } from "../src/ops/backup.ts";
 
 const cfg = loadConfig();
-mkdirSync(cfg.backup_dir, { recursive: true });
-const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const dest = join(cfg.backup_dir, `xuanji-${stamp}.db`);
-const src = new DatabaseSync(cfg.db);
-// Node 24 的 node:sqlite 提供 backup()；它用 SQLite 在线备份接口，拿到的是一致状态。
-await (await import("node:sqlite")).backup(src, dest);
-src.close();
-const keep = 48;
-const files = readdirSync(cfg.backup_dir).filter((f) => f.startsWith("xuanji-")).sort();
-for (const f of files.slice(0, Math.max(0, files.length - keep))) unlinkSync(join(cfg.backup_dir, f));
-console.log(`[backup] ${dest}`);
-// TODO P1-15：把最近一次成功时间写进账本（xj status 显示）；超阈值出异常卡；每周把最新快照恢复到临时目录并 rebuild 比对。
+const base = `http://127.0.0.1:${cfg.port}`;
+const status = await fetch(`${base}/backups`).then((r) => r.json() as Promise<{ drill_ok_at: string | null }>).catch(() => null);
+const lastDrill = process.argv.includes("--drill") ? null : status?.drill_ok_at ?? null;
+let failed = false;
+for (const e of await backupOnce(cfg, new Date(), status ? lastDrill : null)) {
+  console.log(`${e.type} ${JSON.stringify(e.payload, null, 2)}`);
+  if (e.type === "backup.failed" || (e.type === "backup.drilled" && !(e.payload as { ok: boolean }).ok)) failed = true;
+  if (status) await fetch(`${base}/events`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(e) });
+}
+if (!status) console.log("（内核没在跑，结果没有入账）");
+process.exit(failed ? 1 : 0);

@@ -27,8 +27,8 @@ export function underBackpressure(db: DB, limit: number): boolean {
 }
 
 // 推送与静默：只有阻塞性的决策卡（含目标卡、超预算卡、受阻卡）会推送；审核卡和知会卡留在队列里随简报汇总。
-// 两种知会卡例外：简报本身（它兼作心跳，到点没收到就说明系统停了），以及主理人对人刚说的那句话的答复
+// 异常（备份失败等）也推。两种知会卡例外：简报本身（它兼作心跳，到点没收到就说明系统停了），以及主理人对人刚说的那句话的答复
 // （直接立项了、或不像目标），它是对话里的回话，不是打扰。
 export function shouldPush(card: Pick<Card, "kind" | "form">): boolean {
-  return card.kind === "decision" || card.form === "brief" || card.form === "reply";
+  return card.kind === "decision" || card.form === "brief" || card.form === "reply" || card.form === "alert";
 }

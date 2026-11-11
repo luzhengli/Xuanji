@@ -89,6 +89,7 @@ switch (cmd) {
   }
   case "stop": { const r = await emit("human.stop", { about: rest[0] }, rest[0]); print(r, () => `已叫停 ${rest[0]}（事件 #${r.seq}）`); break; }
   case "why": {
+    if (!rest[0]) { console.log(USAGE); break; }
     const ev = await get(`/why/${encodeURIComponent(rest[0] ?? "")}`) as Event[];
     const lines = showAll ? ev.map(showEvent) : foldHeartbeats(ev).map((x) => (x.kind === "event" ? showEvent(x.event)
       : `#${x.first.seq}–#${x.last.seq}  ${x.first.at} – ${x.last.at}  心跳 ${x.count} 次${x.runs.length ? `（${x.runs.join("、")}）` : ""}`));

@@ -3,7 +3,7 @@ import type { AgentKind } from "../shared/config.ts";
 
 // ---- 事件 ----
 // 只携带信息，不携带权限。来源 + 来源编号 用于去重。
-export type EventSource = "human" | "feishu" | "cli" | "timer" | "worker" | "github" | "ci" | "kernel";
+export type EventSource = "human" | "feishu" | "cli" | "timer" | "worker" | "github" | "ci" | "kernel" | "backup";
 
 export interface EventInput {
   source: EventSource;
@@ -119,7 +119,8 @@ export type CardKind = "decision" | "review" | "notice";
 export type CardStatus = "open" | "answered" | "expired" | "withdrawn" | "folded";   // folded：知会卡随简报汇总后收起（P1-22）
 
 // 卡片的样式：目标卡（主理人整理的，确认/修改/不做）、超预算卡、简报、主理人的答复。普通卡片为 null。
-export type CardForm = "goal" | "budget" | "brief" | "reply";
+// alert：异常（备份失败、演练不通过），推送；恢复正常后撤回。
+export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert";
 
 export interface CardOption { key: string; label: string; recommended?: boolean; needs_text?: boolean; }
 
