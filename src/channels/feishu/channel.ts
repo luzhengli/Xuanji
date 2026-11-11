@@ -39,12 +39,18 @@ export class FeishuChannel {
       await this.deps.emit("human.message", `msg:${ev.message_id}`, { text: ev.content, message_id: ev.message_id });
       // TODO P1-10：主理人把一句话整理成目标卡请人确认；小而明确的请求直接 goal.confirmed。
     } else if (key === "card.action.trigger") {
-      const value = safeJson(ev.action_value as string) as { card_id?: string; choice?: string };
-      if (!value.card_id) return;
-      await this.deps.emit("card.answered", `click:${ev.event_id}`, { card_id: value.card_id, choice: value.choice, token: ev.token }, value.card_id);
-      // TODO P1-11：用 token 调 /open-apis/interactive/v1/card/update 把卡片原地改成结论（renderAnswered）。
-      void renderAnswered;
+      const click = parseCardClick(ev, this.deps.owner_open_id);
+      if (!click) return;
+      await this.deps.emit("card.answered", `click:${click.event_id}`, { card_id: click.card_id, choice: click.choice, token: click.token }, click.card_id);
+      // 回答后卡片原地改成结论（实测 S1 验证了 token 更新接口）。TODO P1-11：从账本取卡片正文，而不是只传编号。
+      await this.updateInPlace(click.token, { id: click.card_id, title: click.card_id, body: "", kind: "decision", about: "", options: [], dedupe_key: "", status: "answered", answer: null, external_ref: null, created_at: "", updated_at: "" }, click.choice).catch((e) => console.error("[feishu] 原地更新失败", (e as Error).message));
     }
+  }
+
+  // token 30 分钟内有效，最多用 2 次；要传完整的新卡片 JSON。
+  async updateInPlace(token: string, card: Card, choice: string): Promise<void> {
+    await execFileP(this.cli, ["api", "POST", "/open-apis/interactive/v1/card/update", "--as", "bot",
+      "--data", JSON.stringify({ token, card: renderAnswered(card, choice) })]);
   }
 
   // 发卡片：返回 message_id，内核记为 card.delivered。飞书不可用时卡片留在账本里，连上后补发。
@@ -58,3 +64,14 @@ export class FeishuChannel {
 }
 
 function safeJson(s: string | undefined): unknown { try { return s ? JSON.parse(s) : {}; } catch { return {}; } }
+
+export interface CardClick { event_id: string; card_id: string; choice: string; token: string; message_id: string; }
+
+// 从 card.action.trigger 事件里取回答。实测（2026-11-11）：action_value 是 JSON 字符串，operator_id 是点击者 open_id。
+export function parseCardClick(ev: Record<string, unknown>, owner: string): CardClick | null {
+  if (ev.operator_id !== owner) return null;                   // 只认你本人
+  if (ev.action_tag !== "button") return null;                 // TODO P1-11：form 提交（文字框）走 form_value
+  const value = safeJson(ev.action_value as string) as { card_id?: string; choice?: string };
+  if (!value.card_id || !value.choice) return null;
+  return { event_id: String(ev.event_id), card_id: value.card_id, choice: value.choice, token: String(ev.token), message_id: String(ev.message_id) };
+}

@@ -1,0 +1,14 @@
+{
+  "type": "card.action.trigger",
+  "event_id": "8b6d9631834eab8e4f58a95b825b0001",
+  "timestamp": "1794404284198064",
+  "operator_id": "ou_00000000000000000000000000000001",
+  "message_id": "om_x100b60726c3194a0ce30e02526d5b24",
+  "chat_id": "oc_00000000000000000000000000000002",
+  "host": "im_message",
+  "token": "c-redacted",
+  "action_tag": "button",
+  "action_value": "{\"answer\":\"ack\",\"probe\":\"s1\"}",
+  "checked": false,
+  "card_content": ""
+}
