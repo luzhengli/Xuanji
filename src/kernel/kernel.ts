@@ -8,7 +8,7 @@ import { pickNext } from "./scheduler.ts";
 import { openCards } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
-import type { Event, EventInput, Receipt, Run, Task, TaskState } from "./types.ts";
+import type { Card, Event, EventInput, Receipt, Run, Task, TaskState } from "./types.ts";
 
 // 领活的结果：一件任务、内核签发的轮次编号，以及这一轮要带上的反馈和上一轮回执。
 export interface Claim {
@@ -77,6 +77,15 @@ export class Kernel {
   }
 
   cards() { return openCards(this.db); }
+  // 单张卡片，不论是否已回答。飞书点击后据此把卡片原地改成账本里记下的结论。
+  card(id: string): Card | null {
+    const r = this.db.prepare(`SELECT * FROM cards WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
+    return r ? { ...(r as unknown as Card), options: JSON.parse(r.options as string), answer: r.answer ? JSON.parse(r.answer as string) : null } : null;
+  }
+  // 一条事件挂上的编号，含它签发的（立项事件 → G-x、T-x）。
+  refsOf(seq: number): string[] {
+    return (this.db.prepare(`SELECT ref FROM event_refs WHERE seq = ? ORDER BY ref`).all(seq) as { ref: string }[]).map((r) => r.ref);
+  }
   why(ref: string) { return eventsAbout(this.db, ref); }
   goal(id: string) { return getGoal(this.db, id) ?? null; }
   task(id: string) { return getTask(this.db, id) ?? null; }

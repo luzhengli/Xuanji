@@ -1,6 +1,7 @@
 // 命令行 xj：同一组接口上的第二个客户端。看全局、排查、飞书不可用时照常答卡片。
 import { loadConfig } from "../../shared/config.ts";
 import type { Card, Event } from "../../kernel/types.ts";
+import { showCard, showStatus, type Overview } from "../format.ts";
 
 const cfg = loadConfig();
 const base = `http://127.0.0.1:${cfg.port}`;
@@ -9,9 +10,10 @@ const asJson = argv.includes("--json");
 const [cmd = "status", ...rest] = argv.filter((a) => a !== "--json");
 
 const get = async (p: string): Promise<any> => (await fetch(base + p)).json();
-const emit = async (type: string, payload: Record<string, unknown>, about?: string): Promise<{ seq: number | null; duplicate: boolean }> =>
+type Emitted = { seq: number | null; duplicate: boolean; refs: string[] };
+const emit = async (type: string, payload: Record<string, unknown>, about?: string): Promise<Emitted> =>
   (await fetch(`${base}/events`, { method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ source: "cli", source_id: `${process.pid}-${Date.now()}`, type, at: new Date().toISOString(), about, payload }) })).json() as Promise<{ seq: number | null; duplicate: boolean }>;
+    body: JSON.stringify({ source: "cli", source_id: `${process.pid}-${Date.now()}`, type, at: new Date().toISOString(), about, payload }) })).json() as Promise<Emitted>;
 
 const USAGE = `用法：
   xj goal "<一句话目标>"        说目标（一期：直接立项；主理人确认见 P1-10）
@@ -22,14 +24,6 @@ const USAGE = `用法：
   xj why <编号>                 事件时间线
   xj recall <编号>              链式召回（P2）
   加 --json 输出原始数据`;
-
-const WAITING = { human: "等人", agent: "等 Agent", world: "等世界", none: "不再等" } as const;
-
-function showCard(c: Card): string {
-  const opts = c.options.map((o) => `${o.key}${o.recommended ? "（推荐）" : ""}`).join(" / ");
-  return [`${c.id} [${({ decision: "决策", review: "审核", notice: "知会" })[c.kind]}] ${c.about}  ${c.title}`,
-    ...(c.body ? c.body.split("\n").map((l) => `    ${l}`) : []), ...(opts ? [`    选项：${opts}`] : [])].join("\n");
-}
 
 function showEvent(e: Event): string {
   const p = e.payload as Record<string, unknown>;
@@ -53,32 +47,11 @@ function showEvent(e: Event): string {
   return `#${e.seq}  ${e.at}  ${e.source.padEnd(6)} ${e.type.padEnd(16)} ${what}${e.note ? `${what ? "  " : ""}→ ${e.note}` : ""}`;
 }
 
-type Overview = {
-  goals: { id: string; title: string; status: string }[];
-  tasks: { id: string; goal_id: string; state: string; runs_used: number; waiting_on: keyof typeof WAITING; session_id: string | null }[];
-  cards: Card[]; quota: { agent: string; seven_day_utilization: number | null; five_hour_utilization: number | null }[];
-};
-
-function showStatus(o: Overview): string {
-  const out: string[] = [];
-  const need = o.cards.filter((c) => c.kind !== "notice").length, fyi = o.cards.length - need;
-  out.push(`需要你：${need ? `${need} 张卡片（xj cards）` : "没有"}${fyi ? `；另有 ${fyi} 张知会卡` : ""}`);
-  for (const g of o.goals) {
-    out.push(`${g.id} [${g.status}] ${g.title}`);
-    for (const t of o.tasks.filter((x) => x.goal_id === g.id)) out.push(`  ${t.id} [${t.state}] ${WAITING[t.waiting_on]} · 已跑 ${t.runs_used} 轮`);
-  }
-  for (const q of o.quota) {
-    const pct = (x: number | null) => (x == null ? "?" : `${Math.round(x * 100)}%`);
-    out.push(`额度 ${q.agent}：周 ${pct(q.seven_day_utilization)}，5 小时 ${pct(q.five_hour_utilization)}`);
-  }
-  return out.join("\n");
-}
-
 const print = (data: unknown, human: () => string) => console.log(asJson ? JSON.stringify(data, null, 2) : human());
 
 switch (cmd) {
-  case "goal": { const r = await emit("goal.confirmed", { title: rest.join(" ") }); print(r, () => `已立项（事件 #${r.seq}），xj status 查看`); break; }
-  case "status": { const o = await get("/overview") as Overview; print(o, () => showStatus(o)); break; }
+  case "goal": { const r = await emit("goal.confirmed", { title: rest.join(" ") }); print(r, () => `已立项 ${r.refs.join(" · ")}（事件 #${r.seq}），xj status 查看`); break; }
+  case "status": { const o = await get("/overview") as Overview; print(o, () => showStatus(o, { cardsHint: "xj cards" })); break; }
   case "cards": { const c = await get("/cards") as Card[]; print(c, () => c.map(showCard).join("\n\n") || "没有待处理的卡片"); break; }
   case "answer": {
     const [card, choice, ...note] = rest;

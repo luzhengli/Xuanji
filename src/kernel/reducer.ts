@@ -199,7 +199,7 @@ export const handlers: Record<string, Handler> = {
       else {
         setTaskState(db, task.id, "queued", e.at);  // 答复到了再接上原会话
         db.prepare(`UPDATE tasks SET failures = 0 WHERE id = ?`).run(task.id);
-        setFeedback(db, task.id, `人对“${card.title}”（${card.id}）的回答：${p.choice ?? ""}${p.text ? `；说明：${p.text}` : ""}`);
+        setFeedback(db, task.id, `人对“${card.title}”（${card.id}）的回答：${[p.choice, p.text && (p.choice ? `说明：${p.text}` : p.text)].filter(Boolean).join("；")}`);
       }
     }
   },

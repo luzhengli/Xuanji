@@ -13,7 +13,7 @@ export function startApi(kernel: Kernel, port: number) {
 
       if (route === "POST /events") {               // 一切皆事件
         const e = kernel.ingest(body as EventInput);
-        return json(res, 200, { seq: e?.seq ?? null, duplicate: e === null });
+        return json(res, 200, { seq: e?.seq ?? null, duplicate: e === null, refs: e ? kernel.refsOf(e.seq) : [] });
       }
       if (route === "POST /runs/claim") {            // 接单程序领活；轮次编号由内核签发并返回
         const b = body as { agent: string; at: string; source_id: string; worker?: string; instance?: string };
@@ -23,10 +23,10 @@ export function startApi(kernel: Kernel, port: number) {
       }
       if (route === "GET /cards") return json(res, 200, kernel.cards());
       if (route === "GET /overview") return json(res, 200, kernel.overview());
-      const one = /^GET \/(goals|tasks|runs)\/([^/]+)$/.exec(route);
+      const one = /^GET \/(goals|tasks|runs|cards)\/([^/]+)$/.exec(route);
       if (one) {
         const id = decodeURIComponent(one[2]!);
-        const found = one[1] === "goals" ? kernel.goal(id) : one[1] === "tasks" ? kernel.task(id) : kernel.run(id);
+        const found = one[1] === "goals" ? kernel.goal(id) : one[1] === "tasks" ? kernel.task(id) : one[1] === "runs" ? kernel.run(id) : kernel.card(id);
         return found ? json(res, 200, found) : json(res, 404, { error: `不存在 ${id}` });
       }
       if (url.pathname.startsWith("/why/")) return json(res, 200, kernel.why(decodeURIComponent(url.pathname.slice(5))));
