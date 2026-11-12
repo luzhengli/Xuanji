@@ -107,6 +107,7 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["tasks", "verify_failures", "INTEGER NOT NULL DEFAULT 0"],   // 连续没通过验证的轮数
   ["tasks", "verify_not_before", "TEXT"],                 // 验证者限流：这之前不派验证
   ["runs", "verdict", "TEXT"],                            // 验证轮的结论（JSON，P2-05）
+  ["goals", "split", "INTEGER"],                          // 主理人标了“可能要拆”（P2-08），立项后先跑规划
 ];
 
 export function openStore(path: string): DB {

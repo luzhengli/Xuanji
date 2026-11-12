@@ -6,9 +6,10 @@
   "brief_at": "09:00",
   "worktree_root": "~/xj-worktrees",
   "limits": { "backpressure_cards": 5, "backpressure_hard": 8, "weekly_quota_ratio": 0.8, "downgrade_quota_ratio": 0.6,
-    "per_goal_concurrency": 1, "verify_concurrency": 1, "max_tasks_per_goal": 4, "hop_limit": 8 },
+    "per_goal_concurrency": 2, "verify_concurrency": 1, "max_tasks_per_goal": 4, "hop_limit": 8 },
   "agents": {
-    "claude": { "use": "claude", "kinds": ["code", "plan", "write", "judge"], "tier": "strong", "billing": "subscription", "capacity": 2 },
+    "claude": { "use": "claude", "kinds": ["code", "write", "judge"], "tier": "strong", "billing": "subscription", "capacity": 2 },
+    "planner": { "use": "claude", "kinds": ["plan"], "tier": "strong", "billing": "subscription", "capacity": 1, "model": "claude-opus-5-5" },
     "codex": { "use": "codex", "kinds": ["review"], "tier": "strong", "billing": "subscription", "capacity": 1, "model": "gpt-6.1-sol", "effort": "max" }
   }
 }

@@ -4,6 +4,7 @@ export type Route =
   | { kind: "cards" }
   | { kind: "status" }
   | { kind: "brief" }
+  | { kind: "rulings" }
   | { kind: "stop"; about: string }
   | { kind: "help" }
   | { kind: "unknown"; command: string };
@@ -13,17 +14,19 @@ const SLASH: Record<string, Route["kind"]> = {
   "/card": "cards", "/cards": "cards", "/todo": "cards",
   "/status": "status",
   "/brief": "brief",
+  "/rulings": "rulings", "/ruling": "rulings",
   "/stop": "stop",
   "/help": "help", "/?": "help",
   "/goal": "goal",
 };
-const WORDS: Record<string, Route["kind"]> = { "卡片": "cards", "待办": "cards", "状态": "status", "进度": "status", "简报": "brief", "帮助": "help" };
+const WORDS: Record<string, Route["kind"]> = { "卡片": "cards", "待办": "cards", "状态": "status", "进度": "status", "简报": "brief", "定论": "rulings", "帮助": "help" };
 
 export const HELP = `直接说一句话就是说目标，例如：在 math.mjs 加一个 div 函数。主理人整理成目标卡发给你确认；小而明确的直接立项。
 命令：
 /card 或 卡片、待办：发来待处理的卡片，可以直接在卡片上回答
 /status 或 状态、进度：目标、任务在等谁、额度
 /brief 或 简报：现在就出一份简报（每天 9 点会自动发）
+/rulings 或 定论：生效中的定论，每条一个“作废”按钮
 /stop T-x：停一个任务
 /goal <一句话>：说目标（以 / 开头的目标用它）
 /help 或 帮助：本说明`;

@@ -51,7 +51,7 @@ export const RECEIPT_INSTRUCTIONS = `
 - summary: 一句话
 - evidence: [{check, result} | {artifact, ref}]
 - handoff: 做了什么、停在哪、还剩什么、踩过什么坑（done 时必填；下一轮据此接手）
-- ask: [{question, why, options, recommended}]（要问人时；一张卡片只问一个问题）
+- ask: [{question, why, options, recommended, ruling}]（要问人时；一张卡片只问一个问题。认为某条“已定的事”这次不适用时，ruling 写它的编号 R-x，why 写为什么）
 - later: [{on, timeout, about}]（在等外部事件时）
 - found: [{title, why}]（发现的范围外事项，不要自己去做）
 - effects: 要系统代为执行的对外动作（见下）

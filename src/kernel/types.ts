@@ -38,6 +38,7 @@ export interface Goal {
   grant: Grant;
   base?: string | null;          // 人写明的基底（分支或提交，P2-02）；没写从主干拉
   checks?: string[];             // 检查命令（P2-05）：主理人提议、写在目标卡上，人确认目标卡即批准；直接立项的没有
+  split?: boolean;               // 主理人标了“可能要拆”（P2-08）：立项后先跑规划，没标的照旧一个任务
   status: GoalStatus;
   origin_event: number;
   created_at: string;
@@ -63,6 +64,9 @@ export interface TaskContract {
   agent: { kind: AgentKind; tier: "strong" | "light" };
   skill?: string;
   base?: string;                 // worktree 从哪拉（P2-02）：目标写明的分支或提交；没有就从主干拉
+  // 拆开的目标（P2-08）里的角色：part 是拆出来的一部分，验证通过即完成、不出审核卡；
+  // merge 是合并任务（P2-09），依赖全部 part，它的验证就是目标验收（P2-10），通过后出目标级审核卡。不拆的任务没有这个字段。
+  role?: "part" | "merge";
 }
 
 export interface Task {
@@ -110,7 +114,8 @@ export interface Run {
 export type Outcome = "done" | "waiting" | "ask" | "blocked" | "failed" | "nothing";
 
 export interface ReceiptEvidence { check?: string; result?: string; artifact?: string; ref?: string; }
-export interface ReceiptAsk { question: string; why?: string; options?: string[]; recommended?: string; }
+// ruling：Agent 认为这条定论不适用于这次的情况（P2-07）。不得自行绕过，出卡请人定。
+export interface ReceiptAsk { question: string; why?: string; options?: string[]; recommended?: string; ruling?: string; }
 export interface ReceiptLater { on?: string; timeout?: string; about: string; }
 export interface ReceiptFound { title: string; why?: string; }
 // Agent 在任务里建的 git worktree（P1-28）：接单程序每轮结束后查 git worktree list，路径或分支名带任务编号的随回执上报。
@@ -154,7 +159,9 @@ export type CardStatus = "open" | "answered" | "expired" | "withdrawn" | "folded
 // alert：异常（备份失败、演练不通过），推送；恢复正常后撤回。
 // effect：对外动作失败后问人（重试 / 跳过 / 放弃）。
 // verify：验证三轮还不通过（再给 3 轮 / 按现状审核 / 放弃），或验证者连续没跑成（重新验证 / 按现状审核 / 放弃）。
-export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert" | "effect" | "verify";
+// plan：规划出的拆分计划（按计划拆 / 不拆，一个任务做 / 修改，P2-08）。
+// ruling：Agent 认为某条定论这次不适用（照定论做 / 这次例外 / 作废这条定论，P2-07）。
+export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert" | "effect" | "verify" | "plan" | "ruling";
 
 export interface CardOption { key: string; label: string; recommended?: boolean; needs_text?: boolean; }
 
@@ -203,8 +210,8 @@ export interface Effect {
 
 // ---- 判断点 ----
 // 研判、规划、验证、主理人对话是无状态的模型调用，经接单程序起一次不给工具的 Agent（“判断点也是一轮”）。
-// 一期只有主理人整理目标卡（intake）。轮次表的 task_id 不能为空，所以判断点单独一张表，编号 J-x。
-export type JudgmentKind = "intake";
+// 主理人整理目标卡（intake），规划拆分（plan，P2-08）。轮次表的 task_id 不能为空，所以判断点单独一张表，编号 J-x。
+export type JudgmentKind = "intake" | "plan";
 export type JudgmentStatus = "queued" | "running" | "finished" | "failed";
 
 // 在途的目标：主理人据此判断一句话是新目标，还是对它们的补充（P1-23）。
@@ -218,12 +225,34 @@ export interface IntakeInput {
   feedback?: string | undefined; // 人的修改意见
 }
 
+// 规划的输入（P2-08）：目标、适用的定论；人要求修改计划时带上一版和修改意见。
+// 拆分上限在配置里，领判断点时随结果给（Kernel.claimJudgment），落账时写进结果事件；仓库里有哪些文件由接单程序现列。都不进这里。
+export interface PlanInput {
+  goal: { id: string; title: string; acceptance: string[]; boundaries: string[]; checks: string[]; base?: string | undefined };
+  rulings: { id: string; text: string }[];
+  revision: number;
+  previous?: Plan | undefined;
+  feedback?: string | undefined;   // 人对上一版计划的修改意见
+  note?: string | undefined;       // 人确认目标卡时的补充：带给拆出来的每个任务的第一轮
+}
+
+// 规划的输出：任务图。split=false 时 tasks 为空，照旧一个任务。合并任务不由规划写，内核在拆分时自动加。
+export interface PlanTask {
+  key: string;                   // 规划里的名字（a、b…），depends_on 用它
+  objective: string;
+  criteria: string[];            // 各自独立的验收标准
+  write: string[];               // 可写范围，互不重叠
+  checks: string[];              // 只能从目标已批准的检查命令里挑
+  depends_on: string[];
+}
+export interface Plan { split: boolean; why: string; tasks: PlanTask[]; }
+
 export interface Judgment {
   id: string;
   kind: JudgmentKind;
   about: string;                 // G-x
   status: JudgmentStatus;
-  input: IntakeInput;
+  input: IntakeInput | PlanInput;
   output: unknown;
   error: string | null;
   failures: number;
@@ -249,16 +278,18 @@ export interface Draft {
   budget?: { runs: number; minutes: number } | undefined;   // 只有人明确提到才有
   base?: string | undefined;     // 只有人写明基于哪个分支或提交才有（P2-02）
   checks?: string[] | undefined; // 主理人提议的检查命令（P2-05），人确认目标卡才跑
+  split?: boolean | undefined;   // 可能要拆（P2-08）：确认后先跑规划
   reply?: string | undefined;    // 不是目标时回人的一句话
 }
 
 // ---- 定论 ----
+// 范围（P2-07）：task 只管那个任务；goal 管那个目标下的全部任务；project 管这个工作仓库（二期只有一个项目，等于全局）；global 管以后全部。
 export type RulingScope = "task" | "goal" | "project" | "global";
 
 export interface Ruling {
   id: string;
   scope: RulingScope;
-  scope_ref: string | null;
+  scope_ref: string | null;      // 出处卡片说的那件事（T-x / G-x）；按范围匹配时再换算成目标
   text: string;                  // 人的原话
   origin: string;                // 出处：卡片编号或事件编号
   decided_at: string;

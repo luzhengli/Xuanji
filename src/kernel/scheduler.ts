@@ -18,7 +18,7 @@ export interface Throttle { capacity: number; running: number; subagents: boolea
 export function throttle(db: DB, cfg: Config, agent: string): Throttle | null {
   const profile = cfg.agents[agent];
   if (!profile) return null;
-  const u = weeklyUtilization(db, agent);
+  const u = weeklyUtilization(db, cfg, agent);
   const down = u != null && u >= cfg.limits.downgrade_quota_ratio;
   const running = (db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE agent = ? AND status = 'running' AND purpose = 'execute'`).get(agent) as { n: number }).n;
   return { capacity: down ? Math.min(1, profile.capacity) : profile.capacity, running, subagents: !down,
@@ -102,7 +102,7 @@ function goalRunning(db: DB, goalId: string): number {
     .get(goalId) as { n: number }).n;
 }
 
-function goalFromHuman(db: DB, goalId: string): boolean {
+export function goalFromHuman(db: DB, goalId: string): boolean {
   const r = db.prepare(`SELECT e.source FROM goals g JOIN events e ON e.seq = g.origin_event WHERE g.id = ?`).get(goalId) as { source: string } | undefined;
   return !!r && HUMAN_SOURCES.includes(r.source);
 }
@@ -140,7 +140,12 @@ export function patternsOverlap(a: string, b: string): boolean {
   return x.startsWith(y) || y.startsWith(x);
 }
 
-function weeklyUtilization(db: DB, agent: string): number | null {
-  const q = db.prepare(`SELECT seven_day_utilization AS u FROM quota WHERE agent = ?`).get(agent) as { u: number | null } | undefined;
-  return q?.u ?? null;
+// 周用量是整个账号的：同一个 Agent（use 相同）的几个档案共用一份订阅，取它们里面最近的一次读数。
+// 规划档案（Opus，P2-08）平时不常跑，靠执行档案的读数受降档线和 80% 线管（Agent 定，可逆）。
+function weeklyUtilization(db: DB, cfg: Config, agent: string): number | null {
+  const use = cfg.agents[agent]?.use;
+  const same = Object.entries(cfg.agents).filter(([, p]) => p.use === use).map(([name]) => name);
+  const rows = db.prepare(`SELECT agent, seven_day_utilization AS u, observed_at FROM quota WHERE seven_day_utilization IS NOT NULL`).all() as { agent: string; u: number; observed_at: string | null }[];
+  const mine = rows.filter((r) => same.includes(r.agent)).sort((a, b) => (a.observed_at ?? "").localeCompare(b.observed_at ?? ""));
+  return mine.at(-1)?.u ?? null;
 }

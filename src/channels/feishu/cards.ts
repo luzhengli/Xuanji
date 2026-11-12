@@ -1,7 +1,7 @@
 // 把内核的卡片渲染成飞书 Card 2.0。卡片正文有长度上限，细节放证据链接。
 // 决策卡和审核卡整张是一个表单：文字框、适用范围（仅决策卡）和选项按钮都在里面，点任一按钮就把文字框和范围一起交上来。
 // 表单内的按钮不能带回调值，所以按钮名里编进卡片编号和选项序号：xj_C_3_o0、xj_C_3_text。
-import type { Card, RulingScope } from "../../kernel/types.ts";
+import type { Card, Ruling, RulingScope } from "../../kernel/types.ts";
 
 const TEMPLATE = { decision: "orange", review: "blue", notice: "grey" } as const;
 
@@ -26,6 +26,8 @@ const PLACEHOLDER = (card: Card): string =>
   card.form === "goal" ? "要改什么写在这里，再点“修改”"
     : card.form === "budget" ? "追加时想交代下一轮的话（可选）"
       : card.form === "verify" ? "选“再给 3 轮”时想交代下一轮的话（可选）"
+      : card.form === "plan" ? "要改计划写在这里，再点“修改”；选别的时写的话带给各任务（可选）"
+      : card.form === "ruling" ? "想交代给 Agent 的话（可选）"
       : card.kind === "decision" ? "选项都不合适时写一句话（可选）" : "退回或接管时写意见（可选）";
 
 export function renderCard(card: Card): Record<string, unknown> {
@@ -70,5 +72,33 @@ export function renderAnswered(card: Card): Record<string, unknown> {
       template: card.status === "answered" ? "green" : "grey" },
     body: { elements: [{ tag: "markdown", content: [card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理"
       : card.status === "folded" ? "**已收起**：已汇总进简报，不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）" }] },
+  };
+}
+
+// ---- 定论簿（P2-07，2026-11-12 人定）：/rulings 回一张卡，列出生效中的定论（原话、范围、日期），每条一个“作废”按钮。
+// 这张卡不是内核的卡片（不进注意力队列、不计背压），点按钮直接落一条 ruling.revoked。按钮名里编进定论编号：xj_rv_R_3。
+export const RULINGS_SHOWN = 20;
+export function parseRevokeName(name: string): string | null {
+  const m = /^xj_rv_R_(\d+)$/.exec(name);
+  return m ? `R-${m[1]}` : null;
+}
+
+export function renderRulings(rulings: Ruling[], note = ""): Record<string, unknown> {
+  const shown = rulings.slice(-RULINGS_SHOWN);
+  const scope = (s: RulingScope) => SCOPES.find((x) => x.value === s)?.label ?? s;
+  const lines = shown.map((r) => `**${r.id}**（${scope(r.scope)} · ${r.decided_at.slice(0, 10)} · 出处 ${r.origin}${r.scope_ref ? ` · ${r.scope_ref}` : ""}）\n${r.text}`);
+  const body = [note, lines.length ? lines.join("\n\n") : "没有生效中的定论。",
+    rulings.length > shown.length ? `另有 ${rulings.length - shown.length} 条更早的，用 xj rulings 看。` : ""].filter(Boolean).join("\n\n");
+  const elements: unknown[] = [{ tag: "markdown", content: body }];
+  if (shown.length) {
+    elements.push({ tag: "form", name: "rulings", elements: shown.map((r) => ({
+      tag: "button", name: `xj_rv_${r.id.replace("-", "_")}`, form_action_type: "submit",
+      text: { tag: "plain_text", content: `作废 ${r.id}` }, type: "danger",
+    })) });
+  }
+  return {
+    schema: "2.0", config: { update_multi: true, width_mode: "default" },
+    header: { title: { tag: "plain_text", content: "定论簿" }, subtitle: { tag: "plain_text", content: `生效中 ${rulings.length} 条` }, template: "grey" },
+    body: { elements },
   };
 }

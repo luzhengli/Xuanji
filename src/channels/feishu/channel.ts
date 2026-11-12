@@ -7,12 +7,12 @@ import { promisify } from "node:util";
 import { createInterface } from "node:readline";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { renderCard, renderAnswered, parseButtonName, SCOPES } from "./cards.ts";
+import { renderCard, renderAnswered, parseButtonName, parseRevokeName, renderRulings, SCOPES } from "./cards.ts";
 import { route, HELP } from "./commands.ts";
 import { showStatus, splitCards, type Overview } from "../format.ts";
 import { localDate } from "../../sources/timer.ts";
 import { retryConn } from "../../shared/retry.ts";
-import type { Card, RulingScope } from "../../kernel/types.ts";
+import type { Card, Ruling, RulingScope } from "../../kernel/types.ts";
 
 const execFileP = promisify(execFile);
 
@@ -152,6 +152,13 @@ export class FeishuChannel {
         return;
       }
       case "cards": return this.sendPending(mid);
+      case "rulings": {
+        // 定论簿（P2-07）：生效中的定论一张卡，每条一个“作废”按钮。
+        const rs = await this.deps.kernel.get<Ruling[]>("/rulings");
+        if (!rs.length) { await this.deps.lark.sendText("没有生效中的定论。你在卡片上回答时选了“这个目标”“这个项目”“以后都这样”，或写了说明，就会记成定论。", idem("r", mid)); return; }
+        await this.deps.lark.sendCard(renderRulings(rs), idem("r", mid));
+        return;
+      }
       case "status": {
         const o = await this.deps.kernel.get<Overview>("/overview");
         await this.deps.lark.sendText(showStatus(o, { cardsHint: "发 /card 查看", doneLimit: 3 }), idem("r", mid));
@@ -199,6 +206,8 @@ export class FeishuChannel {
 
   // 点卡片：回答是一条事件；然后把卡片原地改成账本里记下的结论（重复点、过期点都显示已有的结论）。
   private async onClick(ev: Record<string, unknown>): Promise<void> {
+    const revoke = parseRevokeClick(ev, this.deps.owner_open_id);
+    if (revoke) return this.onRevoke(revoke);
     const click = parseCardClick(ev, this.deps.owner_open_id);
     if (!click) return;
     const card = await this.deps.kernel.get<Card>(`/cards/${encodeURIComponent(click.card_id)}`).catch(() => null);
@@ -225,7 +234,22 @@ export class FeishuChannel {
     }
   }
 
+  // 定论簿卡上点“作废”（P2-07）：落一条 ruling.revoked（重复点内核去重、已作废的不再动），再把卡改成剩下的。
+  private async onRevoke(c: { event_id: string; token: string; ruling_id: string }): Promise<void> {
+    await this.deps.kernel.emit("ruling.revoked", `click:${c.event_id}`, { ruling_id: c.ruling_id, via: "feishu" }, c.ruling_id);
+    if (!c.token) return;
+    const rs = await this.deps.kernel.get<Ruling[]>("/rulings");
+    await this.deps.lark.updateCard(c.token, renderRulings(rs, `已作废 ${c.ruling_id}，以后不再注入。`))
+      .catch((e) => this.log(`原地更新定论簿失败：${(e as Error).message}`));
+  }
+
   private log(line: string) { (this.deps.log ?? ((s: string) => console.error(`[feishu] ${s}`)))(line); }
+}
+
+export function parseRevokeClick(ev: Record<string, unknown>, owner: string): { event_id: string; token: string; ruling_id: string } | null {
+  if (ev.operator_id !== owner || ev.action_tag !== "button") return null;
+  const id = parseRevokeName(String(ev.action_name ?? ""));
+  return id ? { event_id: String(ev.event_id), token: String(ev.token ?? ""), ruling_id: id } : null;
 }
 
 function safeJson(s: unknown): unknown { try { return typeof s === "string" && s ? JSON.parse(s) : {}; } catch { return {}; } }

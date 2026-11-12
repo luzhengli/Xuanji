@@ -24,7 +24,7 @@ export function expandHome(p: string): string {
 // 分支名里的简述：先取目标里的文件名和函数名（math.mjs、half(a)），没有再取英文单词，最多 3 个；都没有就只用任务编号。
 // （实测 T-12：只取英文单词时，“先用 Bash 运行 sleep 30 … half(a)”成了 bash-sleep-30。）
 export function branchFor(task: Pick<Task, "id" | "contract">): string {
-  const text = task.contract.objective;
+  const text = task.contract.objective.replace(/\bT-\d+\b/g, " ");   // 合并任务的目标里有子任务编号（P2-09），不进简述
   const code = [...text.matchAll(/([A-Za-z_][A-Za-z0-9_]*)(?=\(|\.(?:mjs|cjs|js|ts|tsx|jsx|py|go|rs|md|json)\b)/g)].map((m) => m[1]!.toLowerCase());
   const words = (text.toLowerCase().match(/[a-z][a-z0-9]*|\d+/g) ?? []).filter((w) => !["js", "ts", "mjs", "py", "md", "json"].includes(w));
   const slug = [...new Set(code.length ? code : words)].slice(0, 3).join("-").slice(0, 24).replace(/-+$/, "");

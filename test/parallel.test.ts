@@ -53,7 +53,7 @@ test("P2-01：执行同时 2 个，第三个等；每目标同时 1 个；一轮
   assert.equal(claim(k)!.task.id, "T-3");
 
   // 同一目标里第二个任务（第三批才会拆出来，这里直接写进投影）：前一个在跑就不派。
-  const k2 = new Kernel(cfg(), ":memory:");
+  const k2 = new Kernel(cfg({ per_goal_concurrency: 1 }), ":memory:");
   goal(k2, "x");
   const first = claim(k2)!;
   k2.db.prepare(`INSERT INTO tasks(id, goal_id, state, contract, created_at, updated_at) VALUES ('T-9', 'G-1', 'queued', ?, ?, ?)`)

@@ -13,6 +13,7 @@ import { Worker } from "../src/worker/worker.ts";
 import { kernelClient } from "../src/worker/http-client.ts";
 import { buildIntakePrompt } from "../src/worker/context-pack.ts";
 import type { AgentAdapter, RunRequest } from "../src/worker/adapters/types.ts";
+import type { IntakeInput } from "../src/kernel/types.ts";
 
 const T0 = "2026-11-12T10:00:00.000Z";
 const at = (ms: number) => new Date(Date.parse(T0) + ms).toISOString();
@@ -41,7 +42,7 @@ test("一句话：先记一个待确认的目标，排一个主理人判断点�
   assert.equal(k.overview().tasks.length, 0);
   assert.equal(k.claim("claude", T0, sid()), null, "确认之前没有活可领");
   const j = k.claimJudgment("claude", T0, sid(), A)!;
-  assert.deepEqual([j.id, j.kind, j.about, j.status, j.input.request, j.worker], ["J-1", "intake", "G-1", "running", "在 math.mjs 加一个 div", "local"]);
+  assert.deepEqual([j.id, j.kind, j.about, j.status, (j.input as IntakeInput).request, j.worker], ["J-1", "intake", "G-1", "running", "在 math.mjs 加一个 div", "local"]);
   assert.equal(k.claimJudgment("claude", T0, sid(), A), null, "同一个判断点不会被领两次");
 });
 
@@ -83,8 +84,8 @@ test("修改：带着上一版和修改意见再排一次主理人；新目标�
   assert.equal(k.goal("G-1")!.status, "proposed");
   const j = k.claimJudgment("claude", T0, sid(), A)!;
   assert.equal(j.id, "J-2");
-  assert.deepEqual([j.input.revision, j.input.request, j.input.feedback, j.input.draft?.title], [1, "在 math.mjs 加一个 div", "再加一条：小数也要对", DRAFT.title]);
-  const prompt = buildIntakePrompt(j.input);
+  assert.deepEqual([(j.input as IntakeInput).revision, (j.input as IntakeInput).request, (j.input as IntakeInput).feedback, (j.input as IntakeInput).draft?.title], [1, "在 math.mjs 加一个 div", "再加一条：小数也要对", DRAFT.title]);
+  const prompt = buildIntakePrompt((j.input as IntakeInput));
   assert.match(prompt, /## 上一版目标卡\n\{"kind":"goal"/);
   assert.match(prompt, /## 人的修改意见（照这个改上一版）\n再加一条：小数也要对/);
   k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id,
@@ -275,8 +276,8 @@ test("补充等确认的目标：这句话的目标作废并入，旧目标卡�
   draft(k, DRAFT);                                             // G-1 的目标卡 C-1
   k.ingest({ source: "feishu", source_id: sid(), type: "human.message", at: T0, payload: { text: "pow 也要支持小数指数" } });
   const j = k.claimJudgment("claude", T0, sid(), A)!;
-  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: DRAFT.title, status: "proposed" }]);
-  assert.match(buildIntakePrompt(j.input), /## 在途的目标（人之前说过、还没结束的）\n- G-1（目标卡等人确认）：math\.mjs 新增 div\(a, b\)/);
+  assert.deepEqual((j.input as IntakeInput).pending, [{ goal: "G-1", title: DRAFT.title, status: "proposed" }]);
+  assert.match(buildIntakePrompt((j.input as IntakeInput)), /## 在途的目标（人之前说过、还没结束的）\n- G-1（目标卡等人确认）：math\.mjs 新增 div\(a, b\)/);
   k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
   assert.equal(k.goal("G-2")!.status, "abandoned");
   assert.equal(k.card("C-1")!.status, "withdrawn");
@@ -296,7 +297,7 @@ test("补充正在跑的任务：回执到时有新补充，不出审核卡，�
   assert.match(c2.feedback!, /负数要报错/);
   said("pow 再加一条：0 的 0 次方返回 1", k);                 // G-2，跑的过程中说的
   const j = k.claimJudgment("claude", T0, sid(), A)!;
-  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: "加 pow", status: "active", task: "T-1" }]);
+  assert.deepEqual((j.input as IntakeInput).pending, [{ goal: "G-1", title: "加 pow", status: "active", task: "T-1" }]);
   k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
   assert.match(k.cards().find((c) => c.form === "reply")!.body, /T-1 这一轮跑完后带着它开下一轮/);
   k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c2.run_id, task_id: "T-1", receipt: { outcome: "done", summary: "改好了", handoff: "h" } } });
@@ -327,8 +328,8 @@ test("补充等人审核的任务：主理人看得到它；并入时撤回审�
   assert.equal(k.task("T-1")!.state, "awaiting_review");
   said("补充：再加一个解释 cube 的 print 函数", k);
   const j = k.claimJudgment("claude", T0, sid(), A)!;
-  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: "加 cube", status: "active", task: "T-1", reviewing: true }]);
-  assert.match(buildIntakePrompt(j.input), /- G-1（做完了等人审核，任务 T-1）：加 cube/);
+  assert.deepEqual((j.input as IntakeInput).pending, [{ goal: "G-1", title: "加 cube", status: "active", task: "T-1", reviewing: true }]);
+  assert.match(buildIntakePrompt((j.input as IntakeInput)), /- G-1（做完了等人审核，任务 T-1）：加 cube/);
   k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
   assert.equal(k.card("C-1")!.status, "withdrawn");
   assert.equal(k.task("T-1")!.state, "queued");

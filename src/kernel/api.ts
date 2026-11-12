@@ -33,6 +33,7 @@ export function startApi(kernel: Kernel, port: number) {
         return json(res, 200, kernel.claimEffect(b.at, b.source_id, b.worker && b.instance ? { worker: b.worker, instance: b.instance } : undefined) ?? { effect: null });
       }
       if (route === "GET /backups") return json(res, 200, kernel.backups());
+      if (route === "GET /rulings") return json(res, 200, kernel.rulings(url.searchParams.get("all") === "1"));   // 定论簿（P2-07）
       if (route === "GET /cards") return json(res, 200, kernel.cards());
       if (route === "GET /cards/stale") return json(res, 200, kernel.staleCards());   // 飞书上要改过来的卡片（P1-27）
       if (route === "GET /overview") return json(res, 200, kernel.overview());

@@ -2,10 +2,12 @@
 import { parseReceipt } from "../kernel/receipt.ts";
 import { parseVerdict, checksVerdict } from "../kernel/verdict.ts";
 import { parseDraft, type DraftResult } from "../kernel/intake.ts";
+import { parsePlan, DEFAULT_MAX_TASKS, type PlanResult } from "../kernel/plan.ts";
 import { runLimitMinutes } from "../kernel/budget.ts";
-import { buildPrompt, buildResumePrompt, buildIntakePrompt, buildVerifyPrompt } from "./context-pack.ts";
+import { buildPrompt, buildResumePrompt, buildIntakePrompt, buildVerifyPrompt, buildPlanPrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
-import type { CheckResult, Effect, Goal, Judgment, Receipt, Task, Verdict, Worktree } from "../kernel/types.ts";
+import type { CheckResult, Effect, Goal, IntakeInput, Judgment, PlanInput, Receipt, Ruling, Task, Verdict, Worktree } from "../kernel/types.ts";
+import type { DepOutput } from "../kernel/kernel.ts";
 import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
 import { prepareWorkspace, staleProcesses, type Workspace } from "./workspace.ts";
 import { existsSync } from "node:fs";
@@ -14,6 +16,9 @@ import { VERIFY_RUN_MINUTES } from "../kernel/reducer.ts";
 
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
+// 规划（P2-08）用强模型、输出整张任务图：8 分钟结束进程，内核那边 10 分钟判失败（PLAN_TIMEOUT_MS）。
+export const PLAN_RUN_MS = 480_000;
+const PLAN_FILES_MAX = 300;
 
 // 执行轮按角色给最小权限（2026-11-12 人定）。用允许清单而不是禁用清单：Claude Code 升级会悄悄加新工具
 // （实测已有 Cron、ScheduleWakeup、RemoteTrigger、Monitor、SendMessage、EnterWorktree），允许清单下新工具默认拿不到。
@@ -80,11 +85,13 @@ export interface ClaimResult {
   recovery?: string | null;    // 上一轮中断后的恢复说明（P1-14）
   previous: Receipt | null;    // 上一轮回执，取它的交接说明；验证轮里是要验证的那一轮的回执
   verify?: { round: number; subject: string | null; prior: { run_id: string; verdict: Verdict } | null } | undefined;   // 验证轮（P2-05）
+  rulings?: Ruling[] | undefined;   // 按范围匹配的定论（P2-07）
+  deps?: DepOutput[] | undefined;   // 上游任务的产出（P2-08）
 }
 
 export interface KernelClient {
   claim(agent: string): Promise<ClaimResult | { task: null }>;
-  claimJudgment(agent: string): Promise<{ judgment: Judgment | null }>;
+  claimJudgment(agent: string): Promise<{ judgment: (Judgment & { max_tasks?: number }) | null }>;
   claimEffect(): Promise<{ effect: Effect | null; workdir?: string | null; goal_id?: string }>;
   emit(type: string, payload: Record<string, unknown>, about?: string): Promise<void>;
   goal(id: string): Promise<Goal>;
@@ -155,6 +162,7 @@ export class Worker {
   async judgeOnce(agentName: string): Promise<boolean> {
     const { judgment: j } = await this.kernel.claimJudgment(agentName);
     if (!j) return false;
+    if (j.kind === "plan") { await this.plan(agentName, j); return true; }
     this.log(`${j.id} 领到主理人判断点（${j.about}）`);
     let parsed: DraftResult = { ok: false, error: "没有运行" }, res: RunResult | null = null;
     try {
@@ -162,7 +170,7 @@ export class Worker {
       if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
       const profile = this.opts.profiles?.[agentName] ?? {};
       const base = { cwd: this.workRoot, model: profile.model, permission_mode: profile.permission_mode, tools: [] as string[], timeout_ms: JUDGMENT_RUN_MS };
-      res = await adapter.run({ ...base, prompt: buildIntakePrompt(j.input), label: j.id });
+      res = await adapter.run({ ...base, prompt: buildIntakePrompt(j.input as IntakeInput), label: j.id });
       if (res.rate_limit) await this.kernel.emit("quota.observed", { agent: agentName, ...res.rate_limit });
       parsed = res.stopped ? { ok: false, error: "判断点超时" } : res.rate_limited ? { ok: false, error: "订阅额度限流" } : parseDraft(res.last_message);
       if (!parsed.ok && res.session_id && !res.stopped && !res.rate_limited) {
@@ -178,6 +186,37 @@ export class Worker {
       session_id: res?.session_id ?? undefined, usage: res?.usage }, j.about);
     this.log(`${j.id} 交结果：${parsed.ok ? `${parsed.draft.kind}${parsed.draft.direct ? "（直接立项）" : ""} ${parsed.draft.title || parsed.draft.reply}` : `失败 ${parsed.error}`}`);
     return true;
+  }
+
+  // 规划一次（P2-08）：起一次不给工具的强模型，取最后一条消息里的任务图交回内核。仓库里有哪些文件现列给它看。
+  // 格式错了（包括可写范围重叠这类拆分条件不满足）在同一会话里请它重写一次，还不行就交错误，内核重新排队，连续 3 次不拆。
+  private async plan(agentName: string, j: Judgment & { max_tasks?: number }): Promise<void> {
+    const input = j.input as PlanInput;
+    const max = j.max_tasks ?? DEFAULT_MAX_TASKS;
+    const limits = { max_tasks: max, checks: input.goal.checks };
+    this.log(`${j.id} 领到规划（${j.about}，第 ${input.revision + 1} 版）`);
+    let parsed: PlanResult = { ok: false, error: "没有运行" }, res: RunResult | null = null;
+    try {
+      const adapter = this.adapters[agentName];
+      if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
+      const profile = this.opts.profiles?.[agentName] ?? {};
+      const files = await repoFiles(this.workRoot, this.opts.exec ?? execReal);
+      const base = { cwd: this.workRoot, model: profile.model, effort: profile.effort, permission_mode: profile.permission_mode, tools: [] as string[], timeout_ms: PLAN_RUN_MS };
+      res = await adapter.run({ ...base, prompt: buildPlanPrompt(input, max, files), label: j.id });
+      if (res.rate_limit) await this.kernel.emit("quota.observed", { agent: agentName, ...res.rate_limit });
+      parsed = res.stopped ? { ok: false, error: "规划超时" } : res.rate_limited ? { ok: false, error: "订阅额度限流" } : parsePlan(res.last_message, limits);
+      if (!parsed.ok && res.session_id && !res.stopped && !res.rate_limited) {
+        this.log(`${j.id} 计划不合格（${parsed.error}），请它重写`);
+        const retry = await adapter.run({ ...base, prompt: `计划不合格：${parsed.error}。改好后只重写最后一条消息为合法的 JSON 对象。`,
+          session_id: res.session_id, timeout_ms: 180_000, label: `${j.id}-rewrite` });
+        parsed = parsePlan(retry.last_message, limits);
+      }
+    } catch (err) {
+      parsed = { ok: false, error: `接单程序出错：${(err as Error).message}`.slice(0, 300) };
+    }
+    await this.kernel.emit("judgment.result", { judgment_id: j.id, ...(parsed.ok ? { output: parsed.plan } : { error: parsed.error }),
+      session_id: res?.session_id ?? undefined, usage: res?.usage }, j.about);
+    this.log(`${j.id} 交计划：${parsed.ok ? (parsed.plan.split ? `拆成 ${parsed.plan.tasks.map((t) => t.key).join("、")}` : "不拆") : `失败 ${parsed.error}`}`);
   }
 
   // 一次领对外动作（P1-21）：内核已落账，这里执行并把结果报回去。不起 Agent。
@@ -201,11 +240,17 @@ export class Worker {
     const root = this.opts.worktreeRoot;
     const fresh = !task.workdir && !task.session_id && !a.previous;
     if (!root || !(fresh || (task.workdir && !existsSync(task.workdir)))) return { cwd: task.workdir ?? this.workRoot, ws: null };
-    const prep = this.prepLock.then(() => prepareWorkspace(task, this.workRoot, root, this.opts.exec ?? execReal, (s) => this.log(`${a.run_id} ${s}`)));
+    // 有依赖的任务从第一个依赖的分支拉（设计“隔离”，P2-08）：它已经包含上游的改动；合并任务再把其余的合进来。
+    const up = a.deps?.find((d) => d.branch);
+    const from = !task.contract.base && up?.branch ? { ...task, contract: { ...task.contract, base: up.branch } } : task;
+    const prep = this.prepLock.then(() => prepareWorkspace(from, this.workRoot, root, this.opts.exec ?? execReal, (s) => this.log(`${a.run_id} ${s}`)));
     this.prepLock = prep.catch(() => {});
     const ws = await prep;
     if (!ws) return { cwd: task.workdir ?? this.workRoot, ws: null };   // workRoot 不是 git 仓库
-    await this.kernel.emit("workspace.prepared", { task_id: task.id, run_id: a.run_id, ...ws }, task.id);
+    // 合并任务的验证就是目标验收（P2-10）：验证者要看整个目标的改动，账本里的基底记成上游任务当初的基底（主干），
+    // 不是上游分支的头。给 Agent 的提示词照实写从哪拉的。
+    const report = task.contract.role === "merge" && up?.base_commit ? { ...ws, base: `${ws.base}（目标基底 ${up.base_commit.slice(0, 7)}）`, base_commit: up.base_commit } : ws;
+    await this.kernel.emit("workspace.prepared", { task_id: task.id, run_id: a.run_id, ...report }, task.id);
     this.log(`${a.run_id} 工作区 ${ws.path}（${ws.branch}，基底 ${ws.base}@${ws.base_commit.slice(0, 7)}）`);
     return { cwd: ws.path, ws };
   }
@@ -237,8 +282,8 @@ export class Worker {
       disallowed_tools: subagents ? EXECUTION_DISALLOWED : [...EXECUTION_DISALLOWED, ...SUBAGENT_TOOLS],
     };
     const workspace = ws ?? (task.workdir ? { path: task.workdir } : undefined);
-    const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery,
-      workspace, subagents }); // TODO P2-07：按范围匹配定论
+    const fresh = () => buildPrompt({ task, goal, rulings: a.rulings ?? [], deps: a.deps, previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery,
+      workspace, subagents });
 
     // 心跳：定期报到，顺便看内核是否已取消本轮（人说“停”），是就结束进程组。
     const stop = new AbortController();
@@ -270,7 +315,7 @@ export class Worker {
     if (!stop.signal.aborted && (await this.kernel.runStatus(run_id).catch(() => "running")) !== "running") stop.abort();
     if (stop.signal.aborted) { this.log(`${run_id} 已被内核取消（叫停或判为中断），不交回执`); return; }
     if (res.rate_limited) {
-      const w = Object.values(res.rate_limit ?? {}).find((x) => x && x.status && x.status !== "allowed") ?? res.rate_limit?.five_hour;
+      const w = Object.values(res.rate_limit ?? {}).find((x) => x && x.status && !x.status.startsWith("allowed")) ?? res.rate_limit?.five_hour;
       await this.kernel.emit("run.rate_limited", { run_id, task_id: task.id, resets_at: w?.resetsAt }, task.id);
       this.log(`${run_id} 限流，等额度重置`);
       return;
@@ -321,7 +366,7 @@ export class Worker {
         const before = await workspaceState(cwd, exec);
         res = await adapter.run({ ...base, label: run_id, timeout_ms: Math.max(60_000, deadline - Date.now()),
           prompt: buildVerifyPrompt({ task, goal, receipt: a.previous, checks, round: a.verify?.round ?? 1, prior: a.verify?.prior,
-            workspace: { path: cwd, branch, base_commit: task.base_commit }, shell, diff: diff ?? undefined }) }, stop.signal);
+            workspace: { path: cwd, branch, base_commit: task.base_commit }, shell, diff: diff ?? undefined, rulings: a.rulings, deps: a.deps }) }, stop.signal);
         // 验证者只读：前后比一下工作区，动过就不认这次结论（不管是哪个 Agent，沙箱和工具限制之外再兜一层）。
         const after = await workspaceState(cwd, exec);
         if (before !== null && after !== before) {
@@ -347,7 +392,7 @@ export class Worker {
     if (!stop.signal.aborted && (await this.kernel.runStatus(run_id).catch(() => "running")) !== "running") stop.abort();
     if (stop.signal.aborted) { this.log(`${run_id} 已被内核取消（叫停或判为中断），不交结论`); return; }
     if (res?.rate_limited) {
-      const w = Object.values(res.rate_limit ?? {}).find((x) => x && x.status && x.status !== "allowed") ?? res.rate_limit?.seven_day;
+      const w = Object.values(res.rate_limit ?? {}).find((x) => x && x.status && !x.status.startsWith("allowed")) ?? res.rate_limit?.seven_day;
       await this.kernel.emit("run.rate_limited", { run_id, task_id: task.id, resets_at: w?.resetsAt }, task.id);
       this.log(`${run_id} 验证者限流，等额度重置`);
       return;
@@ -413,4 +458,12 @@ export async function workspaceState(cwd: string, exec: Exec): Promise<string | 
   const st = await exec("git", ["status", "--porcelain"], cwd).catch(() => null);
   if (!head || head.code || !st || st.code) return null;
   return `${head.stdout.trim()}\n${st.stdout}`;
+}
+
+// 规划时给它看的文件清单（P2-08）：git ls-files，最多 300 个。不是 git 仓库就空着。
+export async function repoFiles(cwd: string, exec: Exec): Promise<string[]> {
+  const r = await exec("git", ["ls-files"], cwd).catch(() => null);
+  if (!r || r.code) return [];
+  const all = r.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  return all.length > PLAN_FILES_MAX ? [...all.slice(0, PLAN_FILES_MAX), `…另有 ${all.length - PLAN_FILES_MAX} 个`] : all;
 }

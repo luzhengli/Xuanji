@@ -58,6 +58,8 @@ export function normalizeDraft(obj: unknown): DraftResult {
   if (base) draft.base = base;
   const checks = normalizeChecks(r.checks);
   if (checks.length) draft.checks = checks;
+  // 可能要拆（P2-08）：确认后先跑规划。要拆的事不算小而明确，一律请人确认。
+  if (r.split === true) { draft.split = true; draft.direct = false; }
   return { ok: true, draft };
 }
 
@@ -69,7 +71,7 @@ export function normalizeBase(x: unknown): string | undefined {
 
 // 目标卡的正文：提醒（有才列）、验收、边界、授权。目标本身在卡片标题里。
 // 各段之间空一行：飞书的 markdown 不空行时，下一段的标题会接到上一段列表最后一项的末尾（2026-11-12 真实一轮看到）。
-export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"> & { base?: string | null | undefined; checks?: string[] | undefined }, notes: string[] = []): string {
+export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"> & { base?: string | null | undefined; checks?: string[] | undefined; split?: boolean | undefined }, notes: string[] = []): string {
   const bullets = (xs: string[], none: string) => (xs.length ? xs.map((x) => `- ${x}`).join("\n") : `- ${none}`);
   return [
     ...(notes.length ? [`**提醒**\n${bullets(notes, "")}`] : []),
@@ -78,6 +80,8 @@ export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"
     ...(g.base ? [`**基底** 从 ${g.base} 拉分支（不是主干；要改在修改意见里写）`] : []),
     // 检查命令（P2-05，2026-11-12 人定）：人确认目标卡就等于批准在任务的 worktree 里跑这些命令。
     ...(g.checks?.length ? [`**检查命令**（确认即同意在任务的 worktree 里跑）\n${g.checks.map((c) => `- \`${c}\``).join("\n")}`] : []),
+    // 可能要拆（P2-08，2026-11-12 人定）：确认后先规划，拆不拆再出一张卡问人。
+    ...(g.split ? ["**可能要拆** 确认后先由规划切成几个互不重叠的任务，拆分计划再发给你确认"] : []),
     `**授权** ${grantLine(g.grant)}`,
   ].join("\n\n");
 }

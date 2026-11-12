@@ -30,9 +30,9 @@ export interface Config {
     backpressure_hard: number;       // 背压硬上限：到这个数，只放行带人回答的任务和验证轮。默认 8
     weekly_quota_ratio: number;      // 周用量到这个比例只跑人亲自提的目标，默认 0.8（人定 2026-11-12，原为 0.6）
     downgrade_quota_ratio: number;   // 周用量到这个比例执行降为 1 个、禁用子 Agent，默认 0.6
-    per_goal_concurrency: number;    // 每个目标同时几个执行，默认 1
+    per_goal_concurrency: number;    // 每个目标同时几个执行，默认 2（2026-11-13 人定由 1 改 2：不拆的目标只有一个任务，这个上限只管拆开的目标）
     verify_concurrency: number;      // 验证同时几个，默认 1（P2-05）
-    max_tasks_per_goal: number;      // 一个目标最多拆几个任务，默认 4（二期第三批规划时用）
+    max_tasks_per_goal: number;      // 一个目标最多拆几个任务（不含合并任务），默认 4（P2-08 规划）
     hop_limit: number;               // 跳数熔断，默认 8
   };
   agents: Record<string, AgentProfile>;
@@ -46,7 +46,7 @@ export const DEFAULTS: Config = {
   brief_at: "09:00",
   worktree_root: "~/xj-worktrees",
   limits: { backpressure_cards: 5, backpressure_hard: 8, weekly_quota_ratio: 0.8, downgrade_quota_ratio: 0.6,
-    per_goal_concurrency: 1, verify_concurrency: 1, max_tasks_per_goal: 4, hop_limit: 8 },
+    per_goal_concurrency: 2, verify_concurrency: 1, max_tasks_per_goal: 4, hop_limit: 8 },
   agents: {
     claude: { use: "claude", kinds: ["code", "plan", "write", "judge"], tier: "strong", billing: "subscription", capacity: 2 },
   },

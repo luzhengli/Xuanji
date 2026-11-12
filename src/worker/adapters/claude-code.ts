@@ -129,7 +129,9 @@ export function parseStream(ndjson: string): Omit<RunResult, "exit_code" | "stde
       rate_limit = {};
       if (w.five_hour) rate_limit.five_hour = w.five_hour;
       if (w.seven_day) rate_limit.seven_day = w.seven_day;
-      if (info?.status && info.status !== "allowed") rate_limited = true;
+      // 2026-11-13 实测（P2-00）：周用量过 75% 时 status 是 "allowed_warning"（带 surpassedThreshold），还能用，不是限流。
+      // 只有不以 allowed 开头的（rejected 等）才算。之前写成“不等于 allowed”，过了 75% 每一轮都被当成限流。
+      if (info?.status && !info.status.startsWith("allowed")) rate_limited = true;
     }
   }
   // 没有完整的 result 行：用最后一条 assistant 文本。2026-11-12 实测：读端停住时管道写满，

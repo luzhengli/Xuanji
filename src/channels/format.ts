@@ -12,7 +12,7 @@ export type Overview = {
   quota: { agent: string; seven_day_utilization: number | null; five_hour_utilization: number | null }[];
   backpressure?: BackpressureView | undefined;
   slots?: { agent: string; capacity: number; running: number; subagents: boolean; human_only: boolean; utilization: number | null;
-    verifying?: number; verify_capacity?: number; executes?: boolean }[] | undefined;
+    verifying?: number; verify_capacity?: number; planning?: number; executes?: boolean }[] | undefined;
   backup?: { snapshot_ok_at: string | null; snapshot_failed_at: string | null; drill_ok_at: string | null; drill_failed_at: string | null } | undefined;
 };
 
@@ -55,14 +55,16 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
   const done = o.goals.filter((g) => finished(g.status));
   const shownDone = opts.doneLimit === undefined ? done : done.slice(-opts.doneLimit);
   for (const g of [...shownDone, ...active]) {
-    out.push(`${g.id} [${g.status}] ${g.title}${g.status === "proposed" ? "（主理人整理中，或目标卡等你确认）" : ""}`);
+    const tasks = o.tasks.filter((x) => x.goal_id === g.id);
+    out.push(`${g.id} [${g.status}] ${g.title}${g.status === "proposed" ? "（主理人整理中，或目标卡等你确认）" : g.status === "active" && !tasks.length ? "（规划拆分中，或拆分计划等你确认）" : ""}`);
     for (const t of o.tasks.filter((x) => x.goal_id === g.id)) out.push(`  ${t.id} [${t.state}] ${WAITING[t.waiting_on]} · 已跑 ${t.runs_used} 轮`);
   }
   if (shownDone.length < done.length) out.push(`（另有 ${done.length - shownDone.length} 个已结束的目标未列出）`);
   for (const s of o.slots ?? []) {
     const why = s.human_only ? "，周用量过上限，只跑你亲自提的目标" : !s.subagents ? "，周用量过降档线，降档且不起子 Agent" : "";
     if (s.verifying !== undefined) out.push(`验证 ${s.agent}：${s.verifying}/${s.verify_capacity ?? 1} 在跑${s.human_only ? "，周用量过上限，只验证你亲自提的目标" : ""}`);
-    if (s.verifying === undefined || s.executes) out.push(`执行 ${s.agent}：${s.running}/${s.capacity} 在跑${why}`);
+    if (s.planning !== undefined) out.push(`规划 ${s.agent}：${s.planning}/${s.capacity} 在跑${why.replace("降档且不起子 Agent", "规划同时 1 个")}`);
+    if (s.executes ?? (s.verifying === undefined && s.planning === undefined)) out.push(`执行 ${s.agent}：${s.running}/${s.capacity} 在跑${why}`);
   }
   for (const q of o.quota) {
     const pct = (x: number | null) => (x == null ? "?" : `${Math.round(x * 100)}%`);

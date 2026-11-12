@@ -2,13 +2,13 @@
 // ingest() 是唯一入口：追加事件、归并投影、对账，三者同一事务。
 import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
-import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus, lastVerdict } from "./reducer.ts";
+import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus, lastVerdict, rulingsFor, listRulings } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
-import { pickNext, throttle, chooseVerifier } from "./scheduler.ts";
+import { pickNext, throttle, chooseVerifier, goalFromHuman } from "./scheduler.ts";
 import { openCards, rowToCard, backpressureView } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
-import type { Card, Effect, Event, EventInput, Judgment, Receipt, Run, Task, TaskState, Verdict } from "./types.ts";
+import type { Card, Effect, Event, EventInput, Judgment, Receipt, Ruling, Run, Task, TaskState, Verdict, Worktree } from "./types.ts";
 
 // 领对外动作的结果：动作本身，加上执行时要用的工作目录和出身标记所需的编号。
 export interface EffectClaim { effect: Effect; workdir: string | null; goal_id: string; }
@@ -24,7 +24,12 @@ export interface Claim {
   recovery: string | null;     // 上一轮中断后的恢复说明（P1-14）
   previous: Receipt | null;    // 上一轮回执；验证轮里就是要验证的那一轮的回执
   verify?: VerifyClaim;        // 验证轮才有（P2-05）
+  rulings: Ruling[];           // 按范围匹配的定论（P2-07），内联进提示词
+  deps: DepOutput[];           // 上游任务的产出（P2-08）：交接说明的摘要和分支；有依赖的任务从第一个依赖的分支拉
 }
+
+// 上游任务的产出（设计“上下文”：内联摘要，附路径）。
+export interface DepOutput { task_id: string; objective: string; branch: string | null; base_commit: string | null; summary: string; handoff: string; }
 
 // 验证轮要带的东西：第几轮、被验证的执行轮、上一次验证意见（第 2 轮起，看问题改了没有）。检查命令在契约里。
 export interface VerifyClaim { round: number; subject: string | null; prior: { run_id: string; verdict: Verdict } | null; }
@@ -74,29 +79,37 @@ export class Kernel {
       if (!e) return null; // 同一个来源编号重复领活：不再派第二次
       const run = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC, rowid DESC LIMIT 1`)
         .get(before.id) as { id: string };
+      const ctx = { rulings: rulingsFor(this.db, { goal_id: before.goal_id, task_id: before.id }), deps: this.depsOf(before) };
       if (a.purpose === "verify") {
         const subject = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND purpose = 'execute' AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(before.id) as { id: string } | undefined;
         const prior = lastVerdict(this.db, before.id);
         return { task: getTask(this.db, before.id)!, agent, purpose: "verify", subagents: false, run_id: run.id, feedback: null, recovery: null,
-          previous: this.lastReceipt(before.id),
+          previous: this.lastReceipt(before.id), ...ctx,
           verify: { round: (before.verify_failures ?? 0) + 1, subject: subject?.id ?? null, prior: prior && !prior.verdict.pass && (before.verify_failures ?? 0) > 0 ? { run_id: prior.id, verdict: prior.verdict } : null } };
       }
       return { task: getTask(this.db, before.id)!, agent, purpose: a.purpose, subagents: a.subagents, run_id: run.id,
-        feedback: before.feedback, recovery: before.recovery, previous: this.lastReceipt(before.id) };
+        feedback: before.feedback, recovery: before.recovery, previous: this.lastReceipt(before.id), ...ctx };
     });
   }
 
   // 领判断点（P1-10 主理人）：和领活分开，判断点不占执行的并发名额，也不受背压和额度挡，
   // 因为它是人刚说的话、不给工具、几十秒就结束；否则人发一句话要等正在跑的长任务做完才有回音。
-  claimJudgment(agent: string, at: string, source_id: string, who?: WorkerIdentity): Judgment | null {
+  // 规划（P2-08）只给 kinds 有 plan 的档案（配置里单独一个强模型档案，2026-11-12 人定）。它用强模型、
+  // 输出大，受额度管：同一档案同时不超过名额（降档时 1 个），过 80% 只规划人亲自提的目标。
+  claimJudgment(agent: string, at: string, source_id: string, who?: WorkerIdentity): (Judgment & { max_tasks?: number }) | null {
     return transaction(this.db, () => {
-      if (!this.cfg.agents[agent]?.kinds.includes("judge")) return null;
-      const next = this.db.prepare(`SELECT id, about FROM judgments WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1`).get() as { id: string; about: string } | undefined;
+      const kinds = this.cfg.agents[agent]?.kinds ?? [];
+      const th = throttle(this.db, this.cfg, agent);
+      const planning = (this.db.prepare(`SELECT COUNT(*) AS n FROM judgments WHERE status = 'running' AND kind = 'plan' AND agent = ?`).get(agent) as { n: number }).n;
+      const queued = this.db.prepare(`SELECT id, kind, about FROM judgments WHERE status = 'queued' ORDER BY created_at, rowid`).all() as { id: string; kind: string; about: string }[];
+      const next = queued.find((j) => j.kind === "intake" ? kinds.includes("judge")
+        : j.kind === "plan" && kinds.includes("plan") && !!th && planning < th.capacity && (!th.human_only || goalFromHuman(this.db, j.about)));
       if (!next) return null;
       const e = this.apply({ source: "worker", source_id, type: "judgment.claimed", at, about: next.about,
         payload: { judgment_id: next.id, agent, ...(who ?? {}) } });
       if (!e) return null;
-      return getJudgment(this.db, next.id) ?? null;
+      const j = getJudgment(this.db, next.id);
+      return j ? { ...j, ...(j.kind === "plan" ? { max_tasks: this.cfg.limits.max_tasks_per_goal } : {}) } : null;
     });
   }
   judgment(id: string) { return getJudgment(this.db, id) ?? null; }
@@ -118,6 +131,19 @@ export class Kernel {
   }
   effect(id: string) { return getEffect(this.db, id) ?? null; }
   backups() { return backupStatus(this.db); }
+
+  // 依赖任务的产出：最后一个交了回执的执行轮的摘要和交接说明，以及它的分支和基底。
+  private depsOf(t: Task): DepOutput[] {
+    return t.contract.depends_on.map((id) => {
+      const d = getTask(this.db, id);
+      const r = this.lastReceipt(id);
+      const wt = d?.worktrees ? (JSON.parse(d.worktrees) as Worktree[]).find((w) => w.path === d.workdir) : undefined;
+      return { task_id: id, objective: d?.contract.objective ?? "", branch: wt?.branch ?? null, base_commit: d?.base_commit ?? null,
+        summary: r?.summary ?? "", handoff: (r?.handoff ?? "").slice(0, 1200) };
+    });
+  }
+
+  rulings(all = false): Ruling[] { return listRulings(this.db, all); }
 
   private lastReceipt(taskId: string): Receipt | null {
     const r = this.db.prepare(`SELECT receipt FROM runs WHERE task_id = ? AND purpose = 'execute' AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { receipt: string } | undefined;
@@ -158,7 +184,10 @@ export class Kernel {
     const slots = Object.keys(this.cfg.agents).map((agent) => ({ agent, ...throttle(this.db, this.cfg, agent)!,
       // 验证者（P2-05）：kinds 有 review 的档案，单列在验证的名额里。
       ...(this.cfg.agents[agent]!.kinds.includes("review") ? { verifying: (this.db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE agent = ? AND status = 'running' AND purpose = 'verify'`).get(agent) as { n: number }).n,
-        verify_capacity: this.cfg.limits.verify_concurrency, executes: this.cfg.agents[agent]!.kinds.includes("code") } : {}) }));
+        verify_capacity: this.cfg.limits.verify_concurrency } : {}),
+      // 规划（P2-08）：kinds 有 plan 的档案，单列规划的名额。
+      ...(this.cfg.agents[agent]!.kinds.includes("plan") ? { planning: (this.db.prepare(`SELECT COUNT(*) AS n FROM judgments WHERE agent = ? AND status = 'running' AND kind = 'plan'`).get(agent) as { n: number }).n } : {}),
+      executes: this.cfg.agents[agent]!.kinds.includes("code") }));
     return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups(), backpressure, slots };
   }
 
@@ -168,7 +197,13 @@ export class Kernel {
 // 落账前补上要随事件记下的配置，重放时不随配置变：
 // - 简报要写背压，背压上限在配置里（P2-06）。
 // - done 回执要不要验证、谁来验证（P2-05）：按配置选验证者，写进事件。由内核定，不听接单程序带来的。
+// - 规划的结果按多少个任务的上限校验（P2-08）：上限在配置里，写进事件。
 function stamp(input: EventInput, cfg: Config, db: DB): EventInput {
+  if (input.type === "judgment.result") {
+    const { max_tasks: _ignored, ...payload } = input.payload;
+    const kind = (db.prepare(`SELECT kind FROM judgments WHERE id = ?`).get(String(payload.judgment_id ?? "")) as { kind: string } | undefined)?.kind;
+    return { ...input, payload: kind === "plan" ? { ...payload, max_tasks: cfg.limits.max_tasks_per_goal } : payload };
+  }
   if (input.type === "brief.due" && !input.payload.backpressure) {
     return { ...input, payload: { ...input.payload, backpressure: { soft: cfg.limits.backpressure_cards, hard: cfg.limits.backpressure_hard } } };
   }

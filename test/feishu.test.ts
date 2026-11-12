@@ -402,3 +402,42 @@ test("P1-27 撤回、收起、在 xj 里回答了的卡片，通道主动在飞�
     assert.equal(h.lark.patches.length, 2, "点击过的卡片不补改");
   } finally { await h.close(); }
 });
+
+// ---- P2-07 定论簿：/rulings 回一张卡，每条一个“作废”按钮；点了落 ruling.revoked，卡片原地改成剩下的 ----
+test("P2-07：/rulings 列出生效中的定论，点“作废”落账并原地更新；没有定论时回一句话", async () => {
+  const h = await setup();
+  try {
+    assert.deepEqual(route("/rulings"), { kind: "rulings" });
+    assert.deepEqual(route("定论"), { kind: "rulings" });
+    await h.say("/rulings");
+    assert.match(h.lark.texts.at(-1)!, /没有生效中的定论/);
+
+    // 两张决策卡，回答时选了范围，落成两条定论。
+    h.kernel.ingest({ source: "cli", source_id: "g-r1", type: "goal.confirmed", at, payload: { title: "加 mod" } });
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "负数取模按哪种", options: ["数学", "JS"] }] });
+    h.kernel.ingest({ source: "cli", source_id: "a-r1", type: "card.answered", at, payload: { card_id: "C-1", choice: "数学", scope: "project" } });
+    h.kernel.ingest({ source: "cli", source_id: "g-r2", type: "goal.confirmed", at, payload: { title: "加 abs" } });
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "abs(-0)", options: ["0"] }] });
+    h.kernel.ingest({ source: "cli", source_id: "a-r2", type: "card.answered", at, payload: { card_id: "C-2", choice: "0", text: "返回 0，不要 -0", scope: "global" } });
+
+    await h.say("/rulings");
+    const card = JSON.stringify(h.lark.cards.at(-1)!.card);
+    assert.match(card, /定论簿/);
+    assert.match(card, /\*\*R-1\*\*（这个项目 · 2026-11-12 · 出处 C-1 · T-1）\\n负数取模按哪种 → 数学/);
+    assert.match(card, /\*\*R-2\*\*（以后都这样.*\\n返回 0，不要 -0/);
+    assert.match(card, /"name":"xj_rv_R_1".*"content":"作废 R-1"/);
+
+    await h.click("xj_rv_R_1");
+    assert.deepEqual(h.kernel.rulings().map((r) => r.id), ["R-2"]);
+    assert.equal(h.kernel.rulings(true).find((r) => r.id === "R-1")!.revoked, true);
+    const updated = JSON.stringify(h.lark.updates.at(-1)!.card);
+    assert.match(updated, /已作废 R-1，以后不再注入/);
+    assert.doesNotMatch(updated, /xj_rv_R_1/);
+    await h.click("xj_rv_R_1");   // 再点一次：已作废，不再动
+    assert.equal(h.kernel.why("R-1").filter((e) => e.type === "ruling.revoked").length, 2);
+    assert.equal(h.kernel.why("R-1").filter((e) => e.note === "人作废了这条定论").length, 1);
+    // 别人点的不算。
+    await h.channel.handle("card.action.trigger", JSON.stringify({ ...ev, operator_id: "ou_other", event_id: "evt_x", action_name: "xj_rv_R_2" }));
+    assert.deepEqual(h.kernel.rulings().map((r) => r.id), ["R-2"]);
+  } finally { await h.close(); }
+});
