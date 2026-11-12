@@ -1,13 +1,16 @@
 // 接单程序：领任务、起进程、心跳、停止、交回执。与内核同机，经本机接口连进来，自己保管凭据。
 import { parseReceipt } from "../kernel/receipt.ts";
+import { parseVerdict, checksVerdict } from "../kernel/verdict.ts";
 import { parseDraft, type DraftResult } from "../kernel/intake.ts";
 import { runLimitMinutes } from "../kernel/budget.ts";
-import { buildPrompt, buildResumePrompt, buildIntakePrompt } from "./context-pack.ts";
+import { buildPrompt, buildResumePrompt, buildIntakePrompt, buildVerifyPrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
-import type { Effect, Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
+import type { CheckResult, Effect, Goal, Judgment, Receipt, Task, Verdict, Worktree } from "../kernel/types.ts";
 import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
 import { prepareWorkspace, staleProcesses, type Workspace } from "./workspace.ts";
 import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { VERIFY_RUN_MINUTES } from "../kernel/reducer.ts";
 
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
@@ -33,6 +36,35 @@ export const EXECUTION_DISALLOWED = ["Bash(git push:*)", "Bash(gh pr create:*)",
   "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)",
   "Bash(lark-cli:*)", "Bash(claude:*)", "Bash(codex:*)", "Bash(crontab:*)", "Bash(launchctl:*)", "Bash(at:*)", "Bash(osascript:*)"];
 
+// 检查命令（P2-05）：一条最多跑 10 分钟，输出只留末尾。
+export const CHECK_TIMEOUT_MS = 600_000;
+const CHECK_OUTPUT_MAX = 2_000;
+
+// 检查命令照用 Bash 禁用规则（2026-11-12 人定）：命令里任何一段（&&、||、;、|、$( ) 隔开的）以禁用的命令开头，就不跑。
+// 和 Agent 那边一样是尽力而为的拦截；真正的边界是命令只在任务的 worktree 里跑、而且是人确认过的。
+export const BLOCKED_COMMANDS = EXECUTION_DISALLOWED.map((r) => /^Bash\((.+):\*\)$/.exec(r)?.[1]).filter((x): x is string => !!x);
+export function blockedBy(command: string): string | null {
+  for (const seg of command.split(/&&|\|\||;|\||\$\(|`|\n/)) {
+    const words = seg.trim().split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));   // 去掉开头的 FOO=1
+    const head = words.join(" ");
+    const hit = BLOCKED_COMMANDS.find((b) => head === b || head.startsWith(`${b} `));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// 跑一条检查命令。用登录 shell，和人在终端里跑的环境一致（launchd 下 PATH 很短）。自成进程组，超时连子进程一起结束。
+export type CheckRunner = (command: string, cwd: string, timeoutMs: number) => Promise<{ code: number | null; output: string }>;
+export const runCheckReal: CheckRunner = (command, cwd, timeoutMs) => new Promise((resolve) => {
+  const child = spawn("/bin/zsh", ["-lc", command], { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  let out = "", timedOut = false;
+  const keep = (c: Buffer) => { out = (out + c).slice(-CHECK_OUTPUT_MAX * 2); };
+  child.stdout.on("data", keep); child.stderr.on("data", keep);
+  const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid!, "SIGTERM"); } catch { child.kill("SIGTERM"); } }, timeoutMs);
+  child.on("error", (e) => { clearTimeout(timer); resolve({ code: null, output: e.message }); });
+  child.on("close", (code) => { clearTimeout(timer); resolve({ code: timedOut ? null : code, output: `${out.slice(-CHECK_OUTPUT_MAX)}${timedOut ? `\n（超过 ${timeoutMs / 60_000} 分钟，结束了）` : ""}` }); });
+});
+
 export interface ClaimResult {
   task: Task;
   agent: string;
@@ -41,7 +73,8 @@ export interface ClaimResult {
   run_id: string;              // 内核领活时签发
   feedback: string | null;     // 人的回答或退回意见，带进这一轮
   recovery?: string | null;    // 上一轮中断后的恢复说明（P1-14）
-  previous: Receipt | null;    // 上一轮回执，取它的交接说明
+  previous: Receipt | null;    // 上一轮回执，取它的交接说明；验证轮里是要验证的那一轮的回执
+  verify?: { round: number; subject: string | null; prior: { run_id: string; verdict: Verdict } | null } | undefined;   // 验证轮（P2-05）
 }
 
 export interface KernelClient {
@@ -54,13 +87,14 @@ export interface KernelClient {
 }
 
 export interface WorkerOptions {
-  profiles?: Record<string, { model?: string | undefined; permission_mode?: string | undefined }>;
+  profiles?: Record<string, { model?: string | undefined; permission_mode?: string | undefined; effort?: string | undefined }>;
   heartbeatMs?: number;
   log?: (line: string) => void;
   identity?: { worker: string; instance: string } | undefined;   // 启动报到用，须与客户端领活时带的一致
   reap?: (() => string[]) | undefined;                            // 启动时清理上个实例留下的 Agent 进程
   exec?: Exec | undefined;                                        // 对外动作、建 worktree 用的命令执行器（测试时换成假的）
   worktreeRoot?: string | undefined;                              // 设了就每任务一个 worktree（P2-02）
+  checkRunner?: CheckRunner | undefined;                          // 跑检查命令（P2-05，测试时换成假的）
 }
 
 export class Worker {
@@ -93,7 +127,16 @@ export class Worker {
   async begin(agentName: string): Promise<{ done: Promise<void> } | null> {
     const a = await this.kernel.claim(agentName);
     if (!a.task) return null;
-    this.log(`${a.run_id} 领到 ${a.task.id}${a.task.session_id ? `（接上会话 ${a.task.session_id}）` : ""}${a.recovery ? "，带恢复说明" : ""}${a.subagents === false ? "，不起子 Agent" : ""}`);
+    this.log(`${a.run_id} 领到 ${a.task.id}${a.purpose === "verify" ? `的验证（第 ${a.verify?.round ?? 1} 轮）` : ""}${a.task.session_id && a.purpose !== "verify" ? `（接上会话 ${a.task.session_id}）` : ""}${a.recovery ? "，带恢复说明" : ""}${a.subagents === false && a.purpose !== "verify" ? "，不起子 Agent" : ""}`);
+    if (a.purpose === "verify") {
+      return { done: this.verify(agentName, a).catch(async (err) => {
+        // 验证没跑成：交一个带错误的结论，内核让任务留在“验证中”重新派，连续 3 次问人。
+        const msg = (err as Error).message;
+        this.log(`${a.run_id} 验证出错：${msg}`);
+        await this.kernel.emit("run.verdict", { run_id: a.run_id, task_id: a.task.id, error: `接单程序出错：${msg}`.slice(0, 300), reviewer: agentName }, a.task.id)
+          .catch((e) => this.log(`${a.run_id} 交结论失败：${(e as Error).message}`));
+      }) };
+    }
     return { done: this.execute(agentName, a).catch(async (err) => {
       // 起不了进程、建不了 worktree 之类的故障：交一张 failed 回执，由内核退避重试，任务不会卡在“执行中”。
       const msg = (err as Error).message;
@@ -240,6 +283,89 @@ export class Worker {
     const receipt: Receipt = parsed.ok ? parsed.receipt
       : { outcome: "failed", summary: `回执无法解析：${parsed.error}${res.exit_code ? `；退出码 ${res.exit_code}，${res.stderr.trim().slice(-200)}` : ""}` };
     await this.receipt(a, res, receipt);
+  }
+
+  // 验证一轮（P2-05）：先在任务的 worktree 里跑检查命令（便宜的先跑），没过就不请验证者；过了再起只读的验证者。
+  // 内核只记结果。验证者每次开新会话，看不到执行者的会话；格式错了在它自己的会话里请它重写一次。
+  private async verify(agentName: string, a: ClaimResult): Promise<void> {
+    const { run_id, task } = a;
+    const adapter = this.adapters[agentName];
+    if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
+    // 工作区被删了就不验证：退回人的工作目录去看，看到的是别的分支，结论不可信。交错误，连续 3 次问人。
+    if (task.workdir && !existsSync(task.workdir)) throw new Error(`工作区 ${task.workdir} 不在了，没法验证`);
+    const cwd = task.workdir ?? this.workRoot;
+    const goal = await this.kernel.goal(task.goal_id);
+    const profile = this.opts.profiles?.[agentName] ?? {};
+    let session: string | null = null;
+    const { stop, clear, beat } = this.heartbeat(run_id, task.id, () => session);
+    const deadline = Date.now() + VERIFY_RUN_MINUTES * 60_000;
+    let checks: CheckResult[] = [], verdict: Verdict | null = null, error = "", res: RunResult | null = null;
+    try {
+      checks = await this.runChecks(task.contract.acceptance.checks, cwd, deadline, stop.signal);
+      verdict = checksVerdict(checks);
+      if (verdict) this.log(`${run_id} 检查命令没过，不请验证者`);
+      else if (!stop.signal.aborted) {
+        const branch = (task.worktrees ? JSON.parse(task.worktrees) as Worktree[] : []).find((w) => w.path === cwd)?.branch;
+        const base = { cwd, model: profile.model, effort: profile.effort, sandbox: "read-only" as const, tools: [] as string[],
+          onSession: (id: string) => { session = id; beat().catch(() => {}); } };
+        res = await adapter.run({ ...base, label: run_id, timeout_ms: Math.max(60_000, deadline - Date.now()),
+          prompt: buildVerifyPrompt({ task, goal, receipt: a.previous, checks, round: a.verify?.round ?? 1, prior: a.verify?.prior,
+            workspace: { path: cwd, branch, base_commit: task.base_commit } }) }, stop.signal);
+        if (res.rate_limit) await this.kernel.emit("quota.observed", { agent: agentName, ...res.rate_limit });
+        if (!res.rate_limited && !res.stopped) {
+          let parsed = parseVerdict(res.last_message);
+          if (!parsed.ok && res.session_id && !stop.signal.aborted) {
+            this.log(`${run_id} 验证结论格式错误（${parsed.error}），请它重写`);
+            const retry = await adapter.run({ ...base, prompt: `输出格式错误：${parsed.error}。只重写最后一条消息为合法的 JSON 对象。`,
+              session_id: res.session_id, timeout_ms: 300_000, label: `${run_id}-rewrite` }, stop.signal);
+            parsed = parseVerdict(retry.last_message);
+          }
+          if (parsed.ok) verdict = parsed.verdict;
+          else error = `验证结论无法解析：${parsed.error}${res.exit_code ? `；退出码 ${res.exit_code}，${res.stderr.trim().slice(-200)}` : ""}`;
+        }
+      }
+    } finally {
+      clear();
+    }
+    if (!stop.signal.aborted && (await this.kernel.runStatus(run_id).catch(() => "running")) !== "running") stop.abort();
+    if (stop.signal.aborted) { this.log(`${run_id} 已被内核取消（叫停或判为中断），不交结论`); return; }
+    if (res?.rate_limited) {
+      const w = Object.values(res.rate_limit ?? {}).find((x) => x && x.status && x.status !== "allowed") ?? res.rate_limit?.seven_day;
+      await this.kernel.emit("run.rate_limited", { run_id, task_id: task.id, resets_at: w?.resetsAt }, task.id);
+      this.log(`${run_id} 验证者限流，等额度重置`);
+      return;
+    }
+    if (res?.stopped) error = `验证超时（限时 ${VERIFY_RUN_MINUTES} 分钟）`;
+    await this.kernel.emit("run.verdict", { run_id, task_id: task.id, session_id: session ?? res?.session_id ?? undefined, checks, reviewer: agentName,
+      ...(verdict && !error ? { verdict: { verdict: verdict.pass ? "pass" : "fail", summary: verdict.summary, issues: verdict.issues, risks: verdict.risks } } : { error: error || "没有结论" }),
+      usage: res?.usage }, task.id);
+    this.log(`${run_id} 交结论：${error ? `没跑成 ${error}` : `${verdict!.pass ? "通过" : "没通过"} ${verdict!.summary}`}`);
+  }
+
+  // 检查命令一条一条在工作区里跑。被禁用规则拦下的不跑，记为没跑；时间不够了后面的也不跑。
+  private async runChecks(commands: string[], cwd: string, deadline: number, signal: AbortSignal): Promise<CheckResult[]> {
+    const out: CheckResult[] = [];
+    for (const command of commands) {
+      if (signal.aborted) break;
+      const blocked = blockedBy(command);
+      if (blocked) { out.push({ command, ok: false, exit_code: null, output: "", skipped: `命中禁用规则 ${blocked}` }); continue; }
+      const left = Math.min(CHECK_TIMEOUT_MS, deadline - Date.now() - 60_000);
+      if (left <= 0) { out.push({ command, ok: false, exit_code: null, output: "", skipped: "验证限时用完了" }); continue; }
+      const r = await (this.opts.checkRunner ?? runCheckReal)(command, cwd, left);
+      out.push({ command, ok: r.code === 0, exit_code: r.code, output: r.output.slice(-CHECK_OUTPUT_MAX) });
+      this.log(`检查 \`${command}\` → ${r.code === 0 ? "通过" : `退出码 ${r.code ?? "无（超时或没起来）"}`}`);
+    }
+    return out;
+  }
+
+  // 心跳：定期报到，顺便看内核是否已取消本轮（人说“停”、判了中断），是就 abort。
+  private heartbeat(runId: string, taskId: string, session: () => string | null) {
+    const stop = new AbortController();
+    const beat = () => { const s = session(); return this.kernel.emit("run.heartbeat", { run_id: runId, task_id: taskId, ...(s ? { session_id: s } : {}) }, taskId); };
+    const hb = setInterval(() => {
+      beat().then(() => this.kernel.runStatus(runId)).then((st) => { if (st !== "running") stop.abort(); }).catch(() => {});
+    }, this.opts.heartbeatMs ?? 30_000);
+    return { stop, beat, clear: () => clearInterval(hb) };
   }
 
   private async receipt(a: ClaimResult, res: RunResult | null, receipt: Receipt): Promise<void> {

@@ -12,6 +12,7 @@ export interface AgentProfile {
   billing: Billing;
   capacity: number;
   model?: string;             // 例：claude-haiku-5-5；不写用 Agent 自己的默认
+  effort?: string;            // 思考强度（Codex 的 model_reasoning_effort）。Codex 不加载人的个人配置，所以要显式写（P2-04）
   permission_mode?: string;   // 无界面运行时的权限模式；不写沿用本机 Agent 的设置
   daily_usd?: number;
 }
@@ -30,7 +31,7 @@ export interface Config {
     weekly_quota_ratio: number;      // 周用量到这个比例只跑人亲自提的目标，默认 0.8（人定 2026-11-12，原为 0.6）
     downgrade_quota_ratio: number;   // 周用量到这个比例执行降为 1 个、禁用子 Agent，默认 0.6
     per_goal_concurrency: number;    // 每个目标同时几个执行，默认 1
-    verify_concurrency: number;      // 验证同时几个，默认 1（二期第二批接 Codex 验证者时用）
+    verify_concurrency: number;      // 验证同时几个，默认 1（P2-05）
     max_tasks_per_goal: number;      // 一个目标最多拆几个任务，默认 4（二期第三批规划时用）
     hop_limit: number;               // 跳数熔断，默认 8
   };

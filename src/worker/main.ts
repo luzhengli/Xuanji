@@ -7,17 +7,26 @@ import { loadConfig } from "../shared/config.ts";
 import { Worker } from "./worker.ts";
 import { kernelClient } from "./http-client.ts";
 import { ClaudeCodeAdapter, reapOrphans } from "./adapters/claude-code.ts";
+import { CodexAdapter } from "./adapters/codex.ts";
+import type { AgentAdapter } from "./adapters/types.ts";
 
 const cfg = loadConfig();
 const identity = { worker: process.env.XJ_WORKER_NAME ?? "local", instance: `${process.pid}-${new Date().toISOString()}` };
 const pidDir = join(dirname(resolve(cfg.db)), "worker-pids", identity.worker);
 const client = kernelClient(`http://127.0.0.1:${cfg.port}`, "worker", { worker: identity });
 const workRoot = process.env.XJ_WORK_ROOT ?? process.cwd();
-const worker = new Worker(client, { claude: new ClaudeCodeAdapter({ recordDir: process.env.XJ_RECORD_DIR, pidDir }) }, workRoot,
-  { profiles: cfg.agents, identity, reap: () => reapOrphans(pidDir), worktreeRoot: cfg.worktree_root });
+// 每个档案按 use 配一个适配器（P2-04：Codex 接进来做验证者）。dsh 还没接。
+const recordDir = process.env.XJ_RECORD_DIR;
+const adapters: Record<string, AgentAdapter> = {};
+for (const [name, p] of Object.entries(cfg.agents)) {
+  if (p.use === "claude") adapters[name] = new ClaudeCodeAdapter({ recordDir, pidDir });
+  else if (p.use === "codex") adapters[name] = new CodexAdapter({ recordDir, pidDir });
+}
+const worker = new Worker(client, adapters, workRoot,
+  { profiles: cfg.agents, identity, reap: () => reapOrphans(pidDir, ["claude", "codex"]), worktreeRoot: cfg.worktree_root });
 const POLL_MS = 5_000;
 const JUDGE_POLL_MS = 2_000;   // 主理人是人刚说的话，领得勤一些
-console.log(`[worker] ${identity.worker}（${identity.instance}）工作仓库 ${workRoot}，worktree 在 ${cfg.worktree_root}，档案 ${Object.entries(cfg.agents).map(([k, v]) => `${k}${v.model ? `(${v.model})` : ""}`).join(", ")}`);
+console.log(`[worker] ${identity.worker}（${identity.instance}）工作仓库 ${workRoot}，worktree 在 ${cfg.worktree_root}，档案 ${Object.entries(cfg.agents).map(([k, v]) => `${k}${v.model ? `(${v.model}${v.effort ? ` ${v.effort}` : ""})` : ""}`).join(", ")}`);
 
 // 执行和判断点各一个循环，互不等待：执行一轮可能跑两小时，人这时说一句话，主理人照样马上整理。
 async function poll(name: string, once: (agent: string) => Promise<boolean>, idleMs: number): Promise<never> {

@@ -1,6 +1,7 @@
 // 注意力队列：所有卡片进同一个队列，由内核决定何时打扰人。
 import type { DB } from "./store.ts";
 import type { Card } from "./types.ts";
+import { VERIFY_FEEDBACK_PREFIX } from "./verdict.ts";
 
 export function openCards(db: DB): Card[] {
   const rows = db.prepare(`SELECT * FROM cards WHERE status = 'open' ORDER BY created_at, rowid`).all() as Record<string, unknown>[];
@@ -51,12 +52,13 @@ export function shouldPush(card: Pick<Card, "kind" | "form">): boolean {
   return card.kind === "decision" || card.form === "brief" || card.form === "reply" || card.form === "alert";
 }
 
-// 一件排队的任务在哪条道上。验证轮（第二批）不经排队的任务，直接是 verify 道。
-// 带人回答的：已经跑过、反馈里有人的话（回答卡片、退回、补充、追加预算时说的）。系统自己写的反馈不算。
+// 一件排队的任务在哪条道上。验证轮（P2-05）不经排队的任务，由等验证的任务直接走 verify 道。
+// 带人回答的：已经跑过、反馈里有人的话（回答卡片、退回、补充、追加预算时说的）。系统自己写的反馈（对外动作的结果、验证意见）不算。
 export const SYSTEM_FEEDBACK_PREFIX = "系统已执行";
+const SYSTEM_PREFIXES = [SYSTEM_FEEDBACK_PREFIX, VERIFY_FEEDBACK_PREFIX];
 export function laneOf(t: { runs_used: number; feedback: string | null }): Lane {
   if (t.runs_used === 0) return "new";
-  const human = (t.feedback ?? "").split("\n").some((l) => l.trim() && !l.startsWith(SYSTEM_FEEDBACK_PREFIX));
+  const human = (t.feedback ?? "").split("\n").some((l) => l.trim() && !SYSTEM_PREFIXES.some((p) => l.startsWith(p)));
   return human ? "answered" : "ongoing";
 }
 

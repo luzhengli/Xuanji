@@ -101,6 +101,12 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["tasks", "worktrees", "TEXT"],                         // Agent 建的 git worktree（JSON 数组，P1-28），任务结束后清理
   ["cards", "shown", "TEXT"],                             // 飞书上最后一次显示的状态（P1-27）
   ["goals", "base", "TEXT"],                              // 人写明的基底（P2-02）
+  ["goals", "checks", "TEXT"],                            // 检查命令（JSON 数组，P2-05），人确认目标卡即批准
+  ["tasks", "base_commit", "TEXT"],                       // 系统建的 worktree 的基底提交（P2-02），验证者看改动用
+  ["tasks", "verify_due", "TEXT"],                        // 等哪个档案来验证（P2-05）
+  ["tasks", "verify_failures", "INTEGER NOT NULL DEFAULT 0"],   // 连续没通过验证的轮数
+  ["tasks", "verify_not_before", "TEXT"],                 // 验证者限流：这之前不派验证
+  ["runs", "verdict", "TEXT"],                            // 验证轮的结论（JSON，P2-05）
 ];
 
 export function openStore(path: string): DB {

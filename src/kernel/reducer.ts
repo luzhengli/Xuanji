@@ -9,8 +9,9 @@ import { BUDGET_EXTEND, overBudget, runLimitMinutes } from "./budget.ts";
 import { TITLE_MAX, goalCardBody, normalizeDraft, normalizeBase, minutesText } from "./intake.ts";
 import { backpressureView, backpressureLine, SYSTEM_FEEDBACK_PREFIX } from "./attention.ts";
 import { leasePatterns } from "./scheduler.ts";
+import { MAX_VERIFY_ROUNDS, normalizeChecks, normalizeVerdict, verifyFeedback, issueLine, skippedRisks } from "./verdict.ts";
 import type { Event, Goal, GoalStatus, Grant, Task, TaskContract, TaskState, Receipt, CardKind, CardForm, CardOption, RulingScope,
-  Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect, Worktree } from "./types.ts";
+  Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect, Worktree, Verdict, CheckResult } from "./types.ts";
 
 export type Handler = (db: DB, e: Event) => void;
 
@@ -43,6 +44,16 @@ export const GOAL_OPTIONS: CardOption[] = [
   { key: "confirm", label: "确认", recommended: true }, { key: "revise", label: "修改", needs_text: true }, { key: "drop", label: "不做" },
 ];
 // 超预算卡（人定 2026-11-12：追加 / 停掉 / 接管，推荐停掉；不答就一直停着，不因超时自动执行）。
+// 验证（P2-05）。验证轮不占任务的轮数和时长预算（它有自己的上限：最多 3 轮），单轮限时写死在这里，接单程序先在这个时长处结束进程。
+export const VERIFY_RUN_MINUTES = 30;
+// 验证三轮还不通过（2026-11-12 人定：再给 3 轮 / 按现状审核 / 放弃，推荐按现状审核）。
+export const VERIFY_OPTIONS: CardOption[] = [
+  { key: "more", label: `再给 ${MAX_VERIFY_ROUNDS} 轮` }, { key: "review", label: "按现状审核", recommended: true }, { key: "abandon", label: "放弃" },
+];
+// 验证者连续没跑成（进程出错、输出不合格式、超时）：Agent 定，选项照上面的样子。
+export const VERIFY_ERROR_OPTIONS: CardOption[] = [
+  { key: "retry", label: "重新验证" }, { key: "review", label: "按现状审核", recommended: true }, { key: "abandon", label: "放弃" },
+];
 export const BUDGET_OPTIONS: CardOption[] = [
   { key: "extend", label: `追加 ${BUDGET_EXTEND.runs} 轮和 ${minutesText(BUDGET_EXTEND.minutes)}` },
   { key: "stop", label: "停掉", recommended: true }, { key: "takeover", label: "接管" },
@@ -51,11 +62,14 @@ export const BUDGET_OPTIONS: CardOption[] = [
 export const handlers: Record<string, Handler> = {
   // 人直接立项（xj goal --direct；P1-10 之前的飞书私聊也走这里）。不经主理人。
   "goal.confirmed": (db, e) => {
-    const p = e.payload as { title: string; acceptance?: string[]; boundaries?: string[]; grant?: Partial<Grant>; base?: string };
+    const p = e.payload as { title: string; acceptance?: string[]; boundaries?: string[]; grant?: Partial<Grant>; base?: string; checks?: unknown };
     const grant = { ...DEFAULT_GRANT, ...(p.grant ?? {}) };
     const id = insertGoal(db, e, p.title, p.acceptance ?? [], p.boundaries ?? [], grant, "active");
     const base = normalizeBase(p.base);
     if (base) db.prepare(`UPDATE goals SET base = ? WHERE id = ?`).run(base, id);
+    // 人自己写的检查命令（xj goal --check）就是人批准的（P2-05）。
+    const checks = normalizeChecks(p.checks);
+    if (checks.length) db.prepare(`UPDATE goals SET checks = ? WHERE id = ?`).run(JSON.stringify(checks), id);
     createTask(db, e, id);
   },
 
@@ -117,6 +131,8 @@ export const handlers: Record<string, Handler> = {
     const rid = formatId("RN", nextId(db, "run"));
     db.prepare(`INSERT INTO runs(id, task_id, agent, purpose, status, started_at, heartbeat_at, worker, instance) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)`)
       .run(rid, p.task_id, p.agent, p.purpose, e.at, e.at, p.worker ?? null, p.instance ?? null);
+    // 验证轮（P2-05）：任务留在“验证中”，只读，不登记租约，不占任务的轮数预算。
+    if (p.purpose === "verify") { link(db, e.seq, rid); link(db, e.seq, p.task_id, `${rid} 验证（${p.agent}）`); return; }
     setTaskState(db, p.task_id, "running", e.at);
     // 记下这一轮带走的反馈：回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）。
     db.prepare(`UPDATE runs SET feedback = (SELECT feedback FROM tasks WHERE id = ?) WHERE id = ?`).run(p.task_id, rid);
@@ -135,7 +151,7 @@ export const handlers: Record<string, Handler> = {
     const str = (x: unknown) => (typeof x === "string" ? x : "");
     const path = str(p.path), branch = str(p.branch), repo = str(p.repo);
     if (!t || !path.startsWith("/")) return;
-    db.prepare(`UPDATE tasks SET workdir = ? WHERE id = ?`).run(path, t.id);
+    db.prepare(`UPDATE tasks SET workdir = ?, base_commit = COALESCE(?, base_commit) WHERE id = ?`).run(path, /^[0-9a-f]{7,40}$/.test(str(p.base_commit)) ? str(p.base_commit) : null, t.id);
     const have = worktreesOf(db, t.id).filter((w) => w.path !== path);
     db.prepare(`UPDATE tasks SET worktrees = ? WHERE id = ?`)
       .run(JSON.stringify([...have, { path, ...(branch ? { branch } : {}), ...(repo.startsWith("/") ? { repo } : {}) }]), t.id);
@@ -169,10 +185,13 @@ export const handlers: Record<string, Handler> = {
 
   // 回执到了：按六种结果决定任务去向。卡片的生成也在这里，保证与回执同事务。
   "run.receipt": (db, e) => {
-    const p = e.payload as { run_id: string; task_id: string; session_id?: string; receipt: Receipt; worktrees?: Worktree[] };
+    // verifier：内核落账时按配置写进来的验证者档案（P2-05，Kernel.stamp），重放不随配置变。没有就不验证，直接出审核卡。
+    const p = e.payload as { run_id: string; task_id: string; session_id?: string; receipt: Receipt; worktrees?: Worktree[]; verifier?: string };
     // Agent 建的 worktree 先记下（P1-28），迟到的回执也记：任务结束后要清理，审核卡上要列出。
     if (Array.isArray(p.worktrees) && p.worktrees.length) addWorktrees(db, e, p.task_id, p.worktrees);
-    const run = db.prepare(`SELECT status, feedback FROM runs WHERE id = ?`).get(p.run_id) as { status: string; feedback: string | null } | undefined;
+    const run = db.prepare(`SELECT status, feedback, purpose FROM runs WHERE id = ?`).get(p.run_id) as { status: string; feedback: string | null; purpose: string } | undefined;
+    // 验证轮不交回执，交的是结论（run.verdict）。接单程序出错时也走结论那条路，这里只防万一。
+    if (run?.purpose === "verify") { link(db, e.seq, p.run_id, "验证轮交了回执，不算数"); return; }
     // 迟到的回执（本轮已被取消，或重复投递）只记录在轮次上，不改任务状态，不出卡片。
     if (run && run.status !== "running") {
       db.prepare(`UPDATE runs SET receipt = COALESCE(receipt, ?), session_id = COALESCE(session_id, ?) WHERE id = ?`)
@@ -199,7 +218,13 @@ export const handlers: Record<string, Handler> = {
         // 跑的过程中人又补充了话：不出审核卡，带着补充立即开下一轮（设计“运行途中的新输入”）。
         if (left) { requeue(db, e, p.task_id, "回执到时已有新的补充，带着补充开下一轮"); break; }
         setTaskState(db, p.task_id, "verifying", e.at);
-        // 一期先不做独立验证者（二期接 Codex，P2）。有对外动作就等它们做完再出审核卡，卡上带着结果。
+        // 验证在人之前（P2-05）：有验证者就等它，通过才出审核卡。有对外动作先等它们做完，验证者看的是最终的样子。
+        if (typeof p.verifier === "string" && p.verifier) {
+          db.prepare(`UPDATE tasks SET verify_due = ?, verify_not_before = NULL WHERE id = ?`).run(p.verifier, p.task_id);
+          link(db, e.seq, p.task_id, pendingFx ? `等 ${pendingFx} 个对外动作做完，再请 ${p.verifier} 验证` : `请 ${p.verifier} 验证`);
+          break;
+        }
+        // 没有验证者（配置里没有可用的，或 P2-05 之前的回执）：有对外动作就等它们做完再出审核卡，卡上带着结果。
         if (pendingFx) { link(db, e.seq, p.task_id, `等 ${pendingFx} 个对外动作做完再出审核卡`); break; }
         reviewCard(db, e, p.task_id, p.run_id);
         break;
@@ -260,9 +285,61 @@ export const handlers: Record<string, Handler> = {
     }
   },
 
+  // 验证的结论（P2-05）：检查命令的结果和验证者的结论。通过出审核卡，没通过带着意见开下一轮，三轮不过问人。
+  // 迟到的（这一轮已被判中断、任务已不在验证中）只记在轮次上。验证者的输出在这里再清洗一遍。
+  "run.verdict": (db, e) => {
+    const p = e.payload as { run_id: string; task_id: string; session_id?: string; verdict?: unknown; checks?: unknown; error?: string; reviewer?: string };
+    const run = db.prepare(`SELECT status, purpose, agent FROM runs WHERE id = ?`).get(p.run_id) as { status: string; purpose: string; agent: string } | undefined;
+    if (!run || run.purpose !== "verify") return;
+    const checks = normalizeCheckResults(p.checks);
+    const v = p.error ? { ok: false as const, error: p.error } : normalizeVerdict(p.verdict);
+    const verdict: Verdict | null = v.ok ? { ...v.verdict, risks: [...v.verdict.risks, ...skippedRisks(checks)], ...(checks.length ? { checks } : {}),
+      ...(p.reviewer ? { reviewer: String(p.reviewer).slice(0, 40) } : {}) } : null;
+    const late = run.status !== "running";
+    db.prepare(`UPDATE runs SET status = CASE WHEN status = 'running' THEN 'finished' ELSE status END, finished_at = COALESCE(finished_at, ?),
+        session_id = COALESCE(session_id, ?), verdict = COALESCE(verdict, ?), lost_reason = COALESCE(lost_reason, ?) WHERE id = ?`)
+      .run(e.at, p.session_id ?? null, verdict ? JSON.stringify(verdict) : null, v.ok ? null : `验证者没跑成：${v.error}`.slice(0, 300), p.run_id);
+    const t = getTask(db, p.task_id);
+    if (late || !t || t.state !== "verifying" || !t.verify_due) return;
+    if (!v.ok) { verifyErrored(db, e, t, p.run_id, v.error); return; }
+    db.prepare(`UPDATE tasks SET verify_due = NULL, verify_not_before = NULL, failures = 0 WHERE id = ?`).run(t.id);
+    if (verdict!.pass) {
+      db.prepare(`UPDATE tasks SET verify_failures = 0 WHERE id = ?`).run(t.id);
+      link(db, e.seq, t.id, `${p.run_id} 验证通过`);
+      // 验证期间人又补充了话：不出审核卡，带着补充开下一轮（和 done 时一样）。
+      if (t.feedback) { requeue(db, e, t.id, "验证通过，但验证期间人又补充了话，带着补充开下一轮"); return; }
+      reviewCard(db, e, t.id, subjectRun(db, t.id) ?? p.run_id);
+      return;
+    }
+    const n = (t.verify_failures ?? 0) + 1;
+    db.prepare(`UPDATE tasks SET verify_failures = ? WHERE id = ?`).run(n, t.id);
+    if (n >= MAX_VERIFY_ROUNDS) {
+      setTaskState(db, t.id, "blocked", e.at);
+      createCard(db, e, "decision", t.id, `验证 ${n} 轮没通过：${verdict!.summary}`,
+        [`任务：${t.contract.objective}`, `最后一轮验证意见（${p.run_id}）：\n${verdict!.issues.map((i) => `- ${issueLine(i)}`).join("\n")}`,
+          `残余风险：\n${verdict!.risks.map((r) => `- ${r}`).join("\n")}`,
+          `再给 ${MAX_VERIFY_ROUNDS} 轮：带着这次的意见接着改。按现状审核：出审核卡，你自己看。放弃：任务结束。`].join("\n"),
+        VERIFY_OPTIONS, `verify:${t.id}`, "verify", 900);
+      link(db, e.seq, t.id, `${p.run_id} 验证没通过，连续第 ${n} 轮，问人`);
+      return;
+    }
+    setFeedback(db, t.id, verifyFeedback(p.run_id, n, verdict!));
+    requeue(db, e, t.id, `${p.run_id} 验证没通过（第 ${n} 轮），带着验证意见开下一轮`);
+  },
+
   // 订阅额度用尽不算失败：任务转“等世界”，定时器设在额度重置时间（P1-12 的最小版）。
   "run.rate_limited": (db, e) => {
     const p = e.payload as { run_id?: string; task_id: string; resets_at?: number };
+    const purpose = p.run_id ? (db.prepare(`SELECT purpose FROM runs WHERE id = ?`).get(p.run_id) as { purpose: string } | undefined)?.purpose : undefined;
+    if (purpose === "verify") {
+      // 验证者限流：任务留在“验证中”，到重置时间再派验证（不回执行队列）。
+      const due = p.resets_at ? new Date(p.resets_at * 1000).toISOString() : dueAt(e.at, undefined, RATE_LIMIT_FALLBACK_MS);
+      if (db.prepare(`UPDATE runs SET status = 'finished', finished_at = ?, lost_reason = '验证者限流' WHERE id = ? AND status = 'running'`).run(e.at, p.run_id!).changes) {
+        db.prepare(`UPDATE tasks SET verify_not_before = ? WHERE id = ? AND state = 'verifying'`).run(due, p.task_id);
+        link(db, e.seq, p.task_id, `验证者限流，${due} 后再验证`);
+      }
+      return;
+    }
     if (p.run_id && db.prepare(`UPDATE runs SET status = 'finished', finished_at = ? WHERE id = ? AND status = 'running'`).run(e.at, p.run_id).changes) {
       chargeRun(db, p.run_id, e.at);
     }
@@ -324,6 +401,7 @@ export const handlers: Record<string, Handler> = {
     if (card.form === "goal") { answerGoalCard(db, e, card, p); return; }
     if (card.form === "budget") { answerBudgetCard(db, e, card, p); return; }
     if (card.form === "effect") { answerEffectCard(db, e, card, p); return; }
+    if (card.form === "verify") { answerVerifyCard(db, e, card, p); return; }
     if (p.text || (p.scope && p.scope !== "task")) {
       const rid = formatId("R", nextId(db, "ruling"));
       db.prepare(`INSERT INTO rulings VALUES (?, ?, ?, ?, ?, ?, 0)`)
@@ -333,6 +411,7 @@ export const handlers: Record<string, Handler> = {
     const task = getTask(db, card.about);
     if (!task) return;
     if (card.kind === "review") {
+      db.prepare(`UPDATE tasks SET verify_failures = 0 WHERE id = ?`).run(task.id);   // 人看过了，验证轮数重新算
       if (p.choice === "accept") setTaskState(db, task.id, "done", e.at);
       else if (p.choice === "return") {
         setFeedback(db, task.id, `审核退回（${card.id}）：${p.text ?? "没有附说明，请对照验收标准自查"}`);
@@ -398,11 +477,11 @@ function graceRunning(db: DB, e: Event, why: string): void {
 // ---- 看门狗（P1-19）：每次 timer.tick 跑一遍确定性检查。只比较事件自带的 at，不读时钟。----
 function watchdog(db: DB, e: Event): void {
   const now = Date.parse(e.at);
-  const runs = db.prepare(`SELECT r.id, r.started_at, r.heartbeat_at, t.contract, t.runs_used, t.minutes_used FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.status = 'running'`)
-    .all() as { id: string; started_at: string; heartbeat_at: string; contract: string; runs_used: number; minutes_used: number }[];
+  const runs = db.prepare(`SELECT r.id, r.purpose, r.started_at, r.heartbeat_at, t.contract, t.runs_used, t.minutes_used FROM runs r JOIN tasks t ON t.id = r.task_id WHERE r.status = 'running'`)
+    .all() as { id: string; purpose: string; started_at: string; heartbeat_at: string; contract: string; runs_used: number; minutes_used: number }[];
   for (const r of runs) {
-    // 单轮限时是领活时剩下的时长预算（轮次在跑时 minutes_used 不变，所以重放结果一致）。
-    const limit = runLimitMinutes({ ...r, contract: JSON.parse(r.contract) as TaskContract });
+    // 单轮限时是领活时剩下的时长预算（轮次在跑时 minutes_used 不变，所以重放结果一致）。验证轮固定 30 分钟。
+    const limit = r.purpose === "verify" ? VERIFY_RUN_MINUTES : runLimitMinutes({ ...r, contract: JSON.parse(r.contract) as TaskContract });
     if (now - Date.parse(r.started_at) > limit * 60_000 + RUN_GRACE_MS) markLost(db, e, r.id, `单轮超时（本轮限时 ${Math.round(limit)} 分钟）`);
     else if (now - Date.parse(r.heartbeat_at) > HEARTBEAT_TIMEOUT_MS) markLost(db, e, r.id, `心跳超时（最后心跳 ${r.heartbeat_at}）`);
   }
@@ -420,11 +499,17 @@ function watchdog(db: DB, e: Event): void {
 // 轮次中断：标为 lost，任务带恢复说明回队列；知道会话编号就接上原会话。
 // 中断和 failed 共用连续失败计数：连续第 3 次不再自动重派，转受阻出卡片（处置阶梯的最后一级）。
 function markLost(db: DB, e: Event, runId: string, reason: string): void {
-  const run = db.prepare(`SELECT task_id, session_id FROM runs WHERE id = ?`).get(runId) as { task_id: string; session_id: string | null };
+  const run = db.prepare(`SELECT task_id, session_id, purpose FROM runs WHERE id = ?`).get(runId) as { task_id: string; session_id: string | null; purpose: string };
   db.prepare(`UPDATE runs SET status = 'lost', finished_at = ?, lost_reason = ? WHERE id = ?`).run(e.at, reason, runId);
   chargeRun(db, runId, e.at);
   link(db, e.seq, runId, `中断：${reason}`);
   const task = getTask(db, run.task_id);
+  // 验证轮中断：任务留在“验证中”重新派验证，不回执行队列；连续没跑成的次数和执行共用。
+  if (run.purpose === "verify") {
+    if (task?.state === "verifying" && task.verify_due) verifyErrored(db, e, task, runId, `中断：${reason}`);
+    else link(db, e.seq, run.task_id, `${runId} 验证中断：${reason}`);
+    return;
+  }
   if (task?.state !== "running") { link(db, e.seq, run.task_id, `${runId} 中断：${reason}`); return; }
   // 恢复说明总是记下：即使这次因为预算或连续失败停下，人放行后的下一轮也要先查清上一轮做到哪。
   db.prepare(`UPDATE tasks SET failures = failures + 1, session_id = COALESCE(session_id, ?), recovery = ? WHERE id = ?`)
@@ -499,7 +584,8 @@ export function getGoal(db: DB, id: string): Goal | undefined {
   const r = db.prepare(`SELECT * FROM goals WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
   if (!r) return undefined;
   return { id: r.id as string, title: r.title as string, acceptance: JSON.parse(r.acceptance as string), boundaries: JSON.parse(r.boundaries as string),
-    grant: JSON.parse(r.grant_json as string), base: (r.base as string | null) ?? null, status: r.status as Goal["status"], origin_event: r.origin_event as number,
+    grant: JSON.parse(r.grant_json as string), base: (r.base as string | null) ?? null,
+    ...(r.checks ? { checks: JSON.parse(r.checks as string) as string[] } : {}), status: r.status as Goal["status"], origin_event: r.origin_event as number,
     created_at: r.created_at as string, updated_at: r.updated_at as string };
 }
 
@@ -545,16 +631,16 @@ function reviewBody(r: Receipt, effects: Effect[] = [], worktrees: Worktree[] = 
 const EFFECT_STATUS: Record<Effect["status"], string> = { queued: "未执行", running: "执行中", done: "完成", failed: "失败", rejected: "没执行", cancelled: "作废" };
 
 // 卡片正文的长度上限，细节放证据链接。目标卡和简报要列几条，放宽一些。
-const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, alert: 600, effect: 600, goal: 900, reply: 900, brief: 1500 };
+const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, alert: 600, effect: 600, goal: 900, reply: 900, brief: 1500, verify: 900 };
 
 function createCard(db: DB, e: Event, kind: CardKind, about: string, title: string, body: string, options: CardOption[], dedupeKey: string,
-  form: CardForm | null = null): string | null {
+  form: CardForm | null = null, maxBody?: number): string | null {
   const open = db.prepare(`SELECT id FROM cards WHERE dedupe_key = ? AND status = 'open'`).get(dedupeKey);
   if (open) return null; // 同一个问题还开着时不重复发
   const id = formatId("C", nextId(db, "card"));
   db.prepare(`INSERT INTO cards(id, kind, about, title, body, options, dedupe_key, status, answer, external_ref, created_at, updated_at, form)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, ?, ?, ?)`)
-    .run(id, kind, about, title, body.slice(0, CARD_BODY_MAX[form ?? "plain"]), JSON.stringify(options), dedupeKey, e.at, e.at, form);
+    .run(id, kind, about, title, body.slice(0, maxBody ?? CARD_BODY_MAX[form ?? "plain"]), JSON.stringify(options), dedupeKey, e.at, e.at, form);
   link(db, e.seq, id);
   return id;
 }
@@ -578,7 +664,7 @@ function createTask(db: DB, e: Event, goalId: string): string {
   const tid = formatId("T", nextId(db, "task"));
   const contract: TaskContract = {
     objective: g.title,
-    acceptance: { checks: [], criteria: g.acceptance },
+    acceptance: { checks: g.checks ?? [], criteria: g.acceptance },
     scope: { write: ["**"], effects: g.grant.effects },
     budget: g.grant.budget, ask_first: g.grant.ask_first, depends_on: [],
     agent: { kind: "code", tier: "strong" },
@@ -599,8 +685,8 @@ function activateGoal(db: DB, e: Event, goalId: string): string {
 // ---- 预算（P1-13）----
 // 一轮结束（回执、中断、限流、叫停）时把它跑的时长记到任务上。时间取自事件，不读时钟。
 function chargeRun(db: DB, runId: string, at: string): void {
-  const r = db.prepare(`SELECT task_id, started_at FROM runs WHERE id = ?`).get(runId) as { task_id: string; started_at: string | null } | undefined;
-  if (!r?.started_at) return;
+  const r = db.prepare(`SELECT task_id, started_at, purpose FROM runs WHERE id = ?`).get(runId) as { task_id: string; started_at: string | null; purpose: string } | undefined;
+  if (!r?.started_at || r.purpose === "verify") return;   // 验证轮不占任务的时长预算（P2-05）
   const minutes = Math.max(0, (Date.parse(at) - Date.parse(r.started_at)) / 60_000);
   db.prepare(`UPDATE tasks SET minutes_used = minutes_used + ? WHERE id = ?`).run(minutes, r.task_id);
 }
@@ -650,9 +736,85 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
   const row = db.prepare(`SELECT receipt FROM runs WHERE id = ?`).get(runId) as { receipt: string | null } | undefined;
   const r: Receipt = row?.receipt ? JSON.parse(row.receipt) : { outcome: "done", summary: "（没有回执）" };
   setTaskState(db, taskId, "awaiting_review", e.at);
-  createCard(db, e, "review", taskId, `审核：${r.summary}`, reviewBody(r, effectsOfTask(db, taskId), worktreesOf(db, taskId)),
+  // 验证过的（P2-05）：卡上写验证结论，残余风险原样列出；正文放宽，免得截掉人最该看的部分。没验证过的照旧。
+  const v = verdictAfter(db, taskId, runId);
+  const body = reviewBody(r, effectsOfTask(db, taskId), worktreesOf(db, taskId));
+  createCard(db, e, "review", taskId, `审核：${r.summary}`, v ? `${verdictBody(v.id, v.verdict)}\n${body}` : body,
     [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
-    `review:${taskId}:${runId}`);
+    `review:${taskId}:${runId}`, null, v ? 1500 : undefined);
+}
+
+// 审核卡上的验证一段：结论、检查命令、问题（没通过、人选了按现状审核时才有）、残余风险。
+function verdictBody(runId: string, v: Verdict): string {
+  const checks = (v.checks ?? []).map((c) => `\`${c.command}\` ${c.skipped ? "没跑" : c.ok ? "通过" : c.exit_code == null ? "没跑成" : `退出码 ${c.exit_code}`}`).join("；");
+  return [
+    `**验证** ${v.pass ? "通过" : "没通过"}（${runId}${v.reviewer ? `，${v.reviewer}` : ""}）：${v.summary}`,
+    checks && `检查命令：${checks}`,
+    v.issues.length ? `问题：\n${v.issues.map((i) => `- ${issueLine(i)}`).join("\n")}` : "",
+    `**残余风险**\n${v.risks.map((x) => `- ${x}`).join("\n")}`,
+  ].filter(Boolean).join("\n");
+}
+
+// ---- 验证（P2-05）----
+// 被验证的那一轮：最近一个交了回执的执行轮。
+function subjectRun(db: DB, taskId: string): string | null {
+  const r = db.prepare(`SELECT id FROM runs WHERE task_id = ? AND purpose = 'execute' AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { id: string } | undefined;
+  return r?.id ?? null;
+}
+// 这一轮之后最近的验证结论。
+function verdictAfter(db: DB, taskId: string, runId: string): { id: string; verdict: Verdict } | null {
+  const r = db.prepare(`SELECT id, verdict FROM runs WHERE task_id = ? AND purpose = 'verify' AND verdict IS NOT NULL
+      AND rowid > COALESCE((SELECT rowid FROM runs WHERE id = ?), 0) ORDER BY rowid DESC LIMIT 1`).get(taskId, runId) as { id: string; verdict: string } | undefined;
+  return r ? { id: r.id, verdict: JSON.parse(r.verdict) as Verdict } : null;
+}
+export function lastVerdict(db: DB, taskId: string): { id: string; verdict: Verdict } | null {
+  return verdictAfter(db, taskId, "");
+}
+
+function normalizeCheckResults(x: unknown): CheckResult[] {
+  if (!Array.isArray(x)) return [];
+  return x.slice(0, 5).map((c) => {
+    const o = (c ?? {}) as Record<string, unknown>;
+    return { command: String(o.command ?? "").slice(0, 200), ok: o.ok === true, exit_code: typeof o.exit_code === "number" ? o.exit_code : null,
+      output: String(o.output ?? "").slice(-1000), ...(typeof o.skipped === "string" && o.skipped ? { skipped: o.skipped.slice(0, 200) } : {}) };
+  }).filter((c) => c.command);
+}
+
+// 验证者没跑成（出错、输出不合格式、中断）：任务留在“验证中”重新派；连续第 3 次问人。
+function verifyErrored(db: DB, e: Event, t: Task, runId: string, reason: string): void {
+  const n = t.failures + 1;
+  db.prepare(`UPDATE tasks SET failures = ? WHERE id = ?`).run(n, t.id);
+  if (n < MAX_FAILURES) { link(db, e.seq, t.id, `${runId} 验证者没跑成（${reason}），重新派验证`); return; }
+  setTaskState(db, t.id, "blocked", e.at);
+  createCard(db, e, "decision", t.id, `验证者连续 ${n} 次没跑成`, `最近一次（${runId}）：${reason}\n重新验证：确认验证者能用后再试。按现状审核：不验证了，出审核卡你自己看。放弃：任务结束。`,
+    VERIFY_ERROR_OPTIONS, `verify:${t.id}`, "verify");
+  link(db, e.seq, t.id, `${runId} 验证者连续 ${n} 次没跑成，问人`);
+}
+
+function answerVerifyCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void {
+  const t = getTask(db, card.about);
+  if (!t || t.state !== "blocked") return;
+  const note = p.text?.trim();
+  if (p.choice === "abandon") { setTaskState(db, t.id, "abandoned", e.at); return; }
+  if (p.choice === "review") {
+    db.prepare(`UPDATE tasks SET verify_due = NULL, failures = 0 WHERE id = ?`).run(t.id);
+    const run = subjectRun(db, t.id);
+    if (run) reviewCard(db, e, t.id, run);
+    link(db, e.seq, t.id, "人选按现状审核");
+    return;
+  }
+  if (p.choice === "retry" && t.verify_due) {
+    db.prepare(`UPDATE tasks SET failures = 0, verify_not_before = NULL WHERE id = ?`).run(t.id);
+    setTaskState(db, t.id, "verifying", e.at);
+    link(db, e.seq, t.id, "人选重新验证");
+    return;
+  }
+  // 再给 3 轮（只写了字没点按钮也算）：轮数重新算，带着最后一次验证意见开下一轮。
+  db.prepare(`UPDATE tasks SET verify_failures = 0, failures = 0 WHERE id = ?`).run(t.id);
+  const last = lastVerdict(db, t.id);
+  if (last && !last.verdict.pass) setFeedback(db, t.id, verifyFeedback(last.id, MAX_VERIFY_ROUNDS, last.verdict));
+  if (note) setFeedback(db, t.id, `人对验证卡的说明（${card.id}）：${note}`);
+  requeue(db, e, t.id, `人选再给 ${MAX_VERIFY_ROUNDS} 轮验证`);
 }
 
 // 回执清掉的只是这一轮领走的那部分反馈（反馈只追加，所以是前缀）；之后新到的留下。
@@ -774,6 +936,7 @@ function settleEffects(db: DB, e: Event, taskId: string): void {
   const open = db.prepare(`SELECT 1 FROM effects WHERE task_id = ? AND status IN ('queued','running')`).get(taskId);
   if (open) return;
   const run = db.prepare(`SELECT id FROM runs WHERE task_id = ? AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { id: string };
+  if (t.state === "verifying" && t.verify_due) { link(db, e.seq, taskId, `对外动作做完了，等 ${t.verify_due} 验证`); return; }
   if (t.state === "verifying") { reviewCard(db, e, taskId, run.id); return; }
   const fx = effectsOfRun(db, run.id);
   if (!fx.length) return;
@@ -797,7 +960,8 @@ function answerEffectCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void
     link(db, e.seq, t.id, "人选重试对外动作");
     return;
   }
-  // 跳过：直接出审核卡，卡上照实写哪些没做成。
+  // 跳过：直接出审核卡，卡上照实写哪些没做成。还没验证的先去验证（P2-05）。
+  if (t.state === "blocked" && t.verify_due) { setTaskState(db, t.id, "verifying", e.at); link(db, e.seq, t.id, "人选跳过对外动作，先验证"); return; }
   if (t.state === "blocked" && last) reviewCard(db, e, t.id, last.run_id);
 }
 
@@ -851,7 +1015,7 @@ function amendGoal(db: DB, e: Event, j: Judgment, self: Goal, target: string): v
 
 function draftOf(g: Goal): Draft {
   return { kind: "goal", direct: false, title: g.title, acceptance: g.acceptance, boundaries: g.boundaries, ask_first: g.grant.ask_first, budget: g.grant.budget,
-    ...(g.base ? { base: g.base } : {}) };
+    ...(g.base ? { base: g.base } : {}), ...(g.checks?.length ? { checks: g.checks } : {}) };
 }
 
 // ---- 主理人（P1-10）----
@@ -907,9 +1071,12 @@ function onIntake(db: DB, e: Event, j: Judgment, draft: Draft): void {
   db.prepare(`UPDATE goals SET title = ?, acceptance = ?, boundaries = ?, grant_json = ?, updated_at = ? WHERE id = ?`)
     .run(draft.title, JSON.stringify(draft.acceptance), JSON.stringify(draft.boundaries), JSON.stringify(grant), e.at, goal.id);
   db.prepare(`UPDATE goals SET base = ? WHERE id = ?`).run(draft.base ?? null, goal.id);
+  const direct = draft.direct && j.input.revision === 0 && !draft.budget && !draft.notes?.length;
+  // 检查命令只上目标卡，人确认了才跑；直接立项的不带（P2-05，2026-11-12 人定）。
+  db.prepare(`UPDATE goals SET checks = ? WHERE id = ?`).run(!direct && draft.checks?.length ? JSON.stringify(draft.checks) : null, goal.id);
   // 小而明确的请求跳过确认、直接立项（设计文档“说目标”）。只认初稿，不能改默认预算，也不能带提醒；
   // 改过一次的、主理人觉得有事要人知道的，一律请人确认。
-  if (draft.direct && j.input.revision === 0 && !draft.budget && !draft.notes?.length) {
+  if (direct) {
     const tid = activateGoal(db, e, goal.id);
     createCard(db, e, "notice", goal.id, `已立项 ${goal.id} · ${tid}：${draft.title}`,
       `${goalCardBody(getGoal(db, goal.id)!)}\n\n小而明确，没等你确认就开工了。做完会出审核卡；不想做发 /stop ${tid}。`, [], `reply:${goal.id}`, "reply");

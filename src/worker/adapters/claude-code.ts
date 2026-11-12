@@ -83,7 +83,8 @@ function initSession(out: string): string | null {
 
 // 接单程序启动时调用：上一个实例留下的 Agent 进程组还在跑的，结束掉，免得和重新派发的一轮同时改一个工作目录。
 // 只结束命令行里确实是这个 Agent 的进程，防止 pid 被系统复用后误杀别的进程。返回结束了几个。
-export function reapOrphans(pidDir: string, bin = "claude"): string[] {
+export function reapOrphans(pidDir: string, bins: string | string[] = "claude"): string[] {
+  const names = Array.isArray(bins) ? bins : [bins];
   let files: string[] = [];
   try { files = readdirSync(pidDir).filter((f) => f.endsWith(".pid")); } catch { return []; }
   const reaped: string[] = [];
@@ -92,7 +93,7 @@ export function reapOrphans(pidDir: string, bin = "claude"): string[] {
     const pid = Number(readFileSync(path, "utf8").trim());
     try {
       const cmd = execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
-      if (cmd.includes(bin)) { process.kill(-pid, "SIGTERM"); reaped.push(f.replace(/\.pid$/, "")); }
+      if (names.some((b) => cmd.includes(b))) { process.kill(-pid, "SIGTERM"); reaped.push(f.replace(/\.pid$/, "")); }
     } catch { /* 进程已经不在 */ }
     try { unlinkSync(path); } catch { /* 忽略 */ }
   }

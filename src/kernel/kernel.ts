@@ -2,13 +2,13 @@
 // ingest() 是唯一入口：追加事件、归并投影、对账，三者同一事务。
 import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
-import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus } from "./reducer.ts";
+import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus, lastVerdict } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
-import { pickNext, throttle } from "./scheduler.ts";
+import { pickNext, throttle, chooseVerifier } from "./scheduler.ts";
 import { openCards, rowToCard, backpressureView } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
-import type { Card, Effect, Event, EventInput, Judgment, Receipt, Run, Task, TaskState } from "./types.ts";
+import type { Card, Effect, Event, EventInput, Judgment, Receipt, Run, Task, TaskState, Verdict } from "./types.ts";
 
 // 领对外动作的结果：动作本身，加上执行时要用的工作目录和出身标记所需的编号。
 export interface EffectClaim { effect: Effect; workdir: string | null; goal_id: string; }
@@ -17,13 +17,17 @@ export interface EffectClaim { effect: Effect; workdir: string | null; goal_id: 
 export interface Claim {
   task: Task;
   agent: string;
-  purpose: "execute";
+  purpose: "execute" | "verify";
   subagents: boolean;          // 这一轮能不能起子 Agent（周用量过降档线时 false，P2-01）
   run_id: string;
   feedback: string | null;
   recovery: string | null;     // 上一轮中断后的恢复说明（P1-14）
-  previous: Receipt | null;
+  previous: Receipt | null;    // 上一轮回执；验证轮里就是要验证的那一轮的回执
+  verify?: VerifyClaim;        // 验证轮才有（P2-05）
 }
+
+// 验证轮要带的东西：第几轮、被验证的执行轮、上一次验证意见（第 2 轮起，看问题改了没有）。检查命令在契约里。
+export interface VerifyClaim { round: number; subject: string | null; prior: { run_id: string; verdict: Verdict } | null; }
 
 // 领活的是哪个接单程序。它重启后报到（worker.started），旧实例领的轮次即判中断。
 export interface WorkerIdentity { worker: string; instance: string; }
@@ -35,7 +39,7 @@ export class Kernel {
 
   // 返回落账的事件；重复事件返回 null。
   ingest(input: EventInput): Event | null {
-    return transaction(this.db, () => this.apply(stamp(input, this.cfg)));
+    return transaction(this.db, () => this.apply(stamp(input, this.cfg, this.db)));
   }
 
   private apply(input: EventInput): Event | null {
@@ -62,7 +66,7 @@ export class Kernel {
   // 时间和来源编号由接单程序给（内核不读时钟），轮次编号由归并按计数器签发，重放一致。
   claim(agent: string, at: string, source_id: string, who?: WorkerIdentity): Claim | null {
     return transaction(this.db, () => {
-      const a = pickNext(this.db, this.cfg, agent);
+      const a = pickNext(this.db, this.cfg, agent, at);
       if (!a) return null;
       const before = a.task;
       const e = this.apply({ source: "worker", source_id, type: "run.claimed", at, about: before.id,
@@ -70,6 +74,13 @@ export class Kernel {
       if (!e) return null; // 同一个来源编号重复领活：不再派第二次
       const run = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC, rowid DESC LIMIT 1`)
         .get(before.id) as { id: string };
+      if (a.purpose === "verify") {
+        const subject = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND purpose = 'execute' AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(before.id) as { id: string } | undefined;
+        const prior = lastVerdict(this.db, before.id);
+        return { task: getTask(this.db, before.id)!, agent, purpose: "verify", subagents: false, run_id: run.id, feedback: null, recovery: null,
+          previous: this.lastReceipt(before.id),
+          verify: { round: (before.verify_failures ?? 0) + 1, subject: subject?.id ?? null, prior: prior && !prior.verdict.pass && (before.verify_failures ?? 0) > 0 ? { run_id: prior.id, verdict: prior.verdict } : null } };
+      }
       return { task: getTask(this.db, before.id)!, agent, purpose: a.purpose, subagents: a.subagents, run_id: run.id,
         feedback: before.feedback, recovery: before.recovery, previous: this.lastReceipt(before.id) };
     });
@@ -109,7 +120,7 @@ export class Kernel {
   backups() { return backupStatus(this.db); }
 
   private lastReceipt(taskId: string): Receipt | null {
-    const r = this.db.prepare(`SELECT receipt FROM runs WHERE task_id = ? AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { receipt: string } | undefined;
+    const r = this.db.prepare(`SELECT receipt FROM runs WHERE task_id = ? AND purpose = 'execute' AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { receipt: string } | undefined;
     return r ? JSON.parse(r.receipt) : null;
   }
 
@@ -133,7 +144,7 @@ export class Kernel {
   task(id: string) { return getTask(this.db, id) ?? null; }
   run(id: string): Run | null {
     const r = this.db.prepare(`SELECT * FROM runs WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
-    return r ? { ...(r as unknown as Run), receipt: r.receipt ? JSON.parse(r.receipt as string) : null } : null;
+    return r ? { ...(r as unknown as Run), receipt: r.receipt ? JSON.parse(r.receipt as string) : null, verdict: r.verdict ? JSON.parse(r.verdict as string) : null } : null;
   }
 
   overview() {
@@ -144,15 +155,29 @@ export class Kernel {
     const quota = this.db.prepare(`SELECT * FROM quota`).all();
     // 调度现状（P2-01、P2-06）：背压在哪一档、挡着几件活；各档案的名额和是否降档。按配置现算，不入库。
     const backpressure = backpressureView(this.db, { soft: this.cfg.limits.backpressure_cards, hard: this.cfg.limits.backpressure_hard });
-    const slots = Object.keys(this.cfg.agents).map((agent) => ({ agent, ...throttle(this.db, this.cfg, agent)! }));
+    const slots = Object.keys(this.cfg.agents).map((agent) => ({ agent, ...throttle(this.db, this.cfg, agent)!,
+      // 验证者（P2-05）：kinds 有 review 的档案，单列在验证的名额里。
+      ...(this.cfg.agents[agent]!.kinds.includes("review") ? { verifying: (this.db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE agent = ? AND status = 'running' AND purpose = 'verify'`).get(agent) as { n: number }).n,
+        verify_capacity: this.cfg.limits.verify_concurrency, executes: this.cfg.agents[agent]!.kinds.includes("code") } : {}) }));
     return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups(), backpressure, slots };
   }
 
   close() { this.db.close(); }
 }
 
-// 落账前补上要随事件记下的配置：简报要写背压，背压上限在配置里，记进事件，重放时不随配置变（P2-06）。
-function stamp(input: EventInput, cfg: Config): EventInput {
-  if (input.type !== "brief.due" || input.payload.backpressure) return input;
-  return { ...input, payload: { ...input.payload, backpressure: { soft: cfg.limits.backpressure_cards, hard: cfg.limits.backpressure_hard } } };
+// 落账前补上要随事件记下的配置，重放时不随配置变：
+// - 简报要写背压，背压上限在配置里（P2-06）。
+// - done 回执要不要验证、谁来验证（P2-05）：按配置选验证者，写进事件。由内核定，不听接单程序带来的。
+function stamp(input: EventInput, cfg: Config, db: DB): EventInput {
+  if (input.type === "brief.due" && !input.payload.backpressure) {
+    return { ...input, payload: { ...input.payload, backpressure: { soft: cfg.limits.backpressure_cards, hard: cfg.limits.backpressure_hard } } };
+  }
+  if (input.type === "run.receipt") {
+    const { verifier: _ignored, ...payload } = input.payload;
+    const outcome = (payload.receipt as { outcome?: unknown } | undefined)?.outcome;
+    const run = db.prepare(`SELECT agent FROM runs WHERE id = ?`).get(String(payload.run_id ?? "")) as { agent: string } | undefined;
+    const verifier = outcome === "done" && run ? chooseVerifier(cfg, run.agent) : null;
+    return { ...input, payload: verifier ? { ...payload, verifier } : payload };
+  }
+  return input;
 }

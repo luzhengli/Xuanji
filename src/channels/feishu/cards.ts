@@ -25,6 +25,7 @@ export function parseButtonName(name: string): { card_id: string; option_index?:
 const PLACEHOLDER = (card: Card): string =>
   card.form === "goal" ? "要改什么写在这里，再点“修改”"
     : card.form === "budget" ? "追加时想交代下一轮的话（可选）"
+      : card.form === "verify" ? "选“再给 3 轮”时想交代下一轮的话（可选）"
       : card.kind === "decision" ? "选项都不合适时写一句话（可选）" : "退回或接管时写意见（可选）";
 
 export function renderCard(card: Card): Record<string, unknown> {

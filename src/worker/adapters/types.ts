@@ -4,6 +4,8 @@ export interface RunRequest {
   cwd: string;
   session_id?: string | undefined;   // 有则接上原会话
   model?: string | undefined;
+  effort?: string | undefined;       // 思考强度（Codex 的 model_reasoning_effort，P2-04）；Claude Code 不用
+  sandbox?: "read-only" | "workspace-write" | undefined;   // Codex 的沙箱（验证轮只读，P2-05）；不给时按 tools 推断
   tools?: string[] | undefined;      // 判断点不给工具权限：[]
   disallowed_tools?: string[] | undefined;   // 禁用的工具或命令，例如 Bash(git push:*)
   permission_mode?: string | undefined;

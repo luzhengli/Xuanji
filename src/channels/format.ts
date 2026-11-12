@@ -11,7 +11,8 @@ export type Overview = {
   cards: Card[];
   quota: { agent: string; seven_day_utilization: number | null; five_hour_utilization: number | null }[];
   backpressure?: BackpressureView | undefined;
-  slots?: { agent: string; capacity: number; running: number; subagents: boolean; human_only: boolean; utilization: number | null }[] | undefined;
+  slots?: { agent: string; capacity: number; running: number; subagents: boolean; human_only: boolean; utilization: number | null;
+    verifying?: number; verify_capacity?: number; executes?: boolean }[] | undefined;
   backup?: { snapshot_ok_at: string | null; snapshot_failed_at: string | null; drill_ok_at: string | null; drill_failed_at: string | null } | undefined;
 };
 
@@ -60,7 +61,8 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
   if (shownDone.length < done.length) out.push(`（另有 ${done.length - shownDone.length} 个已结束的目标未列出）`);
   for (const s of o.slots ?? []) {
     const why = s.human_only ? "，周用量过上限，只跑你亲自提的目标" : !s.subagents ? "，周用量过降档线，降档且不起子 Agent" : "";
-    out.push(`执行 ${s.agent}：${s.running}/${s.capacity} 在跑${why}`);
+    if (s.verifying !== undefined) out.push(`验证 ${s.agent}：${s.verifying}/${s.verify_capacity ?? 1} 在跑${s.human_only ? "，周用量过上限，只验证你亲自提的目标" : ""}`);
+    if (s.verifying === undefined || s.executes) out.push(`执行 ${s.agent}：${s.running}/${s.capacity} 在跑${why}`);
   }
   for (const q of o.quota) {
     const pct = (x: number | null) => (x == null ? "?" : `${Math.round(x * 100)}%`);

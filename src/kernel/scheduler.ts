@@ -7,7 +7,8 @@ import { getTask } from "./reducer.ts";
 import type { Task, TaskContract } from "./types.ts";
 
 // subagents：这一轮能不能起子 Agent。周用量过降档线时为 false，接单程序据此从允许清单去掉起子 Agent 的工具。
-export interface Assignment { task: Task; agent: string; purpose: "execute"; subagents: boolean; }
+// purpose：execute 执行一轮；verify 验证最近一轮的产出（P2-05），任务留在“验证中”。
+export interface Assignment { task: Task; agent: string; purpose: "execute" | "verify"; subagents: boolean; }
 
 // 人亲自提的目标：立项的那条事件来自人（飞书、xj、人直接说）。环境触发的（三期）不算。
 const HUMAN_SOURCES = ["human", "feishu", "cli"];
@@ -24,25 +25,64 @@ export function throttle(db: DB, cfg: Config, agent: string): Throttle | null {
     human_only: u != null && u >= cfg.limits.weekly_quota_ratio, utilization: u };
 }
 
-// 由接单程序来领活时调用：返回一件可以派的任务，或 null。
-export function pickNext(db: DB, cfg: Config, agent: string): Assignment | null {
+// 由接单程序来领活时调用：返回一件可以派的活（执行或验证），或 null。at 是接单程序给的时间（验证者限流后的等待用），内核不读时钟。
+export function pickNext(db: DB, cfg: Config, agent: string, at?: string): Assignment | null {
   const profile = cfg.agents[agent];
   const th = throttle(db, cfg, agent);
-  if (!profile || !th || th.running >= th.capacity) return null;
+  if (!profile || !th) return null;
   const level = backpressureLevel(pendingCardCount(db), { soft: cfg.limits.backpressure_cards, hard: cfg.limits.backpressure_hard });
 
-  const rows = db.prepare(`SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at, rowid`).all() as { id: string }[];
-  const candidates = rows.map(({ id }) => getTask(db, id)!).map((task) => ({ task, lane: laneOf(task) }))
+  const queued = th.running < th.capacity
+    ? (db.prepare(`SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at, rowid`).all() as { id: string }[])
+      .map(({ id }) => getTask(db, id)!).map((task) => ({ task, lane: laneOf(task) }))
+    : [];
+  // 等验证的（P2-05）：指定的就是这个档案（落账时按配置选好的，见 Kernel.stamp），验证名额和档案名额都有空。
+  const verifying = canVerify(db, cfg, agent)
+    ? (db.prepare(`SELECT id FROM tasks WHERE state = 'verifying' AND verify_due = ? ORDER BY updated_at, rowid`).all(agent) as { id: string }[])
+      .map(({ id }) => ({ task: getTask(db, id)!, lane: "verify" as const }))
+    : [];
+  const candidates = [...queued, ...verifying]
     .filter(({ lane }) => lanePasses(level, lane))
     .sort((a, b) => LANE_ORDER[a.lane] - LANE_ORDER[b.lane]);   // 稳定排序：同一条道上按排队先后
-  for (const { task } of candidates) {
+  for (const { task, lane } of candidates) {
+    if (th.human_only && !goalFromHuman(db, task.goal_id)) continue;
+    if (lane === "verify") {
+      if (task.verify_not_before && (!at || Date.parse(task.verify_not_before) > Date.parse(at))) continue;   // 验证者限流，等重置
+      if (verifyBusy(db, task.id)) continue;
+      return { task, agent, purpose: "verify", subagents: false };
+    }
     if (!profile.kinds.includes(task.contract.agent.kind)) continue;
     if (task.runs_used >= task.contract.budget.runs) continue;   // 超预算的在回队列时就转受阻了，这里只是兜底
     if (!depsSatisfied(db, task)) continue;
-    if (th.human_only && !goalFromHuman(db, task.goal_id)) continue;
     if (goalRunning(db, task.goal_id) >= cfg.limits.per_goal_concurrency) continue;
     if (leaseConflict(db, task)) continue;
     return { task, agent, purpose: "execute", subagents: th.subagents };
+  }
+  return null;
+}
+
+// 这个档案能不能再接一个验证：它是验证者（kinds 有 review），验证同时不超过 verify_concurrency，档案名额（所有用途合计）有空。
+function canVerify(db: DB, cfg: Config, agent: string): boolean {
+  const profile = cfg.agents[agent];
+  if (!profile?.kinds.includes("review")) return false;
+  const verifying = (db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE status = 'running' AND purpose = 'verify'`).get() as { n: number }).n;
+  const mine = (db.prepare(`SELECT COUNT(*) AS n FROM runs WHERE status = 'running' AND agent = ?`).get(agent) as { n: number }).n;
+  return verifying < cfg.limits.verify_concurrency && mine < profile.capacity;
+}
+
+// 验证要等：这个任务还有轮次在跑，或者对外动作还没做完（验证者看的是最终的样子）。
+function verifyBusy(db: DB, taskId: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM runs WHERE task_id = ? AND status = 'running'`).get(taskId)
+    || !!db.prepare(`SELECT 1 FROM effects WHERE task_id = ? AND status IN ('queued','running') AND kind != 'remove-worktree'`).get(taskId);
+}
+
+// 落账 done 回执时选验证者（P2-05）：kinds 有 review 的档案，不是这一轮的执行者，档位不低于执行者（设计“分派”的两条固定约束）。
+// 没有合适的返回 null：不验证，直接出审核卡。
+export function chooseVerifier(cfg: Config, executor: string): string | null {
+  const rank = { light: 0, strong: 1 } as const;
+  const need = rank[cfg.agents[executor]?.tier ?? "strong"];
+  for (const [name, p] of Object.entries(cfg.agents)) {
+    if (name !== executor && p.use !== cfg.agents[executor]?.use && p.kinds.includes("review") && rank[p.tier] >= need) return name;
   }
   return null;
 }

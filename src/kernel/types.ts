@@ -37,6 +37,7 @@ export interface Goal {
   boundaries: string[];
   grant: Grant;
   base?: string | null;          // 人写明的基底（分支或提交，P2-02）；没写从主干拉
+  checks?: string[];             // 检查命令（P2-05）：主理人提议、写在目标卡上，人确认目标卡即批准；直接立项的没有
   status: GoalStatus;
   origin_event: number;
   created_at: string;
@@ -77,6 +78,10 @@ export interface Task {
   failures: number;              // 连续 failed 或中断的次数
   recovery: string | null;       // 上一轮中断后的恢复说明；回执到达时清空
   worktrees?: string | null;     // Agent 在这个任务里建的 git worktree（JSON 数组，P1-28）；任务结束后清理
+  base_commit?: string | null;   // 系统建的 worktree 从哪个提交拉出（P2-02），验证者据此看改动
+  verify_due?: string | null;    // 等哪个档案来验证最近一轮的产出（P2-05）；验证有了结论就清空
+  verify_failures?: number;      // 连续没通过验证的轮数，到 3 出卡问人
+  verify_not_before?: string | null;   // 验证者限流时，这之前不派验证
   created_at: string;
   updated_at: string;
 }
@@ -95,6 +100,7 @@ export interface Run {
   heartbeat_at: string | null;
   finished_at: string | null;
   receipt: Receipt | null;
+  verdict?: Verdict | null;      // 验证轮的结论（purpose = verify，P2-05）
   worker: string | null;         // 领活的接单程序名与实例
   instance: string | null;
   lost_reason: string | null;    // 中断原因：心跳超时、单轮超时、接单程序重启
@@ -112,6 +118,21 @@ export interface ReceiptFound { title: string; why?: string; }
 export interface Worktree { path: string; branch?: string | undefined; repo?: string | undefined; }
 // 要系统代为执行的对外动作（P1-21）。Agent 自己不做，写进回执；内核先落账，接单程序再执行。
 export interface ReceiptEffect { kind: string; branch?: string; base?: string; remote?: string; title?: string; body?: string; }
+
+// ---- 验证（P2-05）----
+// 第一层：契约里的检查命令，接单程序在任务的 worktree 里跑，内核只记结果。
+// skipped：没跑（被 Bash 禁用规则拦下等），不算没通过，写进残余风险。
+export interface CheckResult { command: string; ok: boolean; exit_code: number | null; output: string; skipped?: string | undefined; }
+export interface VerdictIssue { criterion?: string | undefined; problem: string; where?: string | undefined; }
+// 第二层：验证者的结论。只报违反验收标准或会出错的问题；必须列出残余风险。
+export interface Verdict {
+  pass: boolean;
+  summary: string;
+  issues: VerdictIssue[];
+  risks: string[];
+  checks?: CheckResult[] | undefined;
+  reviewer?: string | undefined;   // 档案名；检查命令没过、没请验证者时没有
+}
 
 export interface Receipt {
   outcome: Outcome;
@@ -132,7 +153,8 @@ export type CardStatus = "open" | "answered" | "expired" | "withdrawn" | "folded
 // 卡片的样式：目标卡（主理人整理的，确认/修改/不做）、超预算卡、简报、主理人的答复。普通卡片为 null。
 // alert：异常（备份失败、演练不通过），推送；恢复正常后撤回。
 // effect：对外动作失败后问人（重试 / 跳过 / 放弃）。
-export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert" | "effect";
+// verify：验证三轮还不通过（再给 3 轮 / 按现状审核 / 放弃），或验证者连续没跑成（重新验证 / 按现状审核 / 放弃）。
+export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert" | "effect" | "verify";
 
 export interface CardOption { key: string; label: string; recommended?: boolean; needs_text?: boolean; }
 
@@ -226,6 +248,7 @@ export interface Draft {
   notes?: string[] | undefined;  // 提醒：人确认前该知道的情况（例如要加的函数已经有了），只上卡片，不进契约
   budget?: { runs: number; minutes: number } | undefined;   // 只有人明确提到才有
   base?: string | undefined;     // 只有人写明基于哪个分支或提交才有（P2-02）
+  checks?: string[] | undefined; // 主理人提议的检查命令（P2-05），人确认目标卡才跑
   reply?: string | undefined;    // 不是目标时回人的一句话
 }
 

@@ -6,7 +6,14 @@ import { localDate } from "../../sources/timer.ts";
 
 const cfg = loadConfig();
 const base = `http://127.0.0.1:${cfg.port}`;
-const argv = process.argv.slice(2);
+// --check "<命令>" 可以给多次：直接立项时带上检查命令（P2-05）。人自己写的命令就是人批准的。
+const checks: string[] = [];
+const argv: string[] = [];
+const raw = process.argv.slice(2);
+for (let i = 0; i < raw.length; i++) {
+  if (raw[i] === "--check" && i + 1 < raw.length) checks.push(raw[++i]!);
+  else argv.push(raw[i]!);
+}
 const FLAGS = ["--json", "--all", "--direct"];
 const asJson = argv.includes("--json");
 const showAll = argv.includes("--all");
@@ -21,7 +28,8 @@ const emit = async (type: string, payload: Record<string, unknown>, about?: stri
 
 const USAGE = `用法：
   xj goal "<一句话目标>"        说目标：主理人整理成目标卡请你确认（xj cards 看，xj answer 答）
-  xj goal --direct "<一句话>"   跳过主理人直接立项
+  xj goal --direct "<一句话>" [--check "<命令>"]...
+                                跳过主理人直接立项；--check 写检查命令，做完后在任务的 worktree 里跑
   xj status                     目标、任务按“在等谁”分组，卡片队列，额度读数
   xj cards                      待处理卡片
   xj answer <C-x> <选项> [说明] [--scope task|goal|project|global]
@@ -43,10 +51,14 @@ function showEvent(e: Event): string {
       what = `${p.judgment_id} ${p.error ? `失败：${p.error}` : o?.kind === "not_goal" ? `不是目标：${o.reply}` : `${o?.direct ? "直接立项" : "目标卡"}：${o?.title}`}`; break;
     }
     case "brief.due": what = `${p.date ?? ""}${p.manual ? "（手动）" : ""}`; break;
-    case "run.claimed": what = `${p.task_id} 由 ${p.agent} 执行`; break;
+    case "run.claimed": what = `${p.task_id} 由 ${p.agent} ${p.purpose === "verify" ? "验证" : "执行"}`; break;
+    case "run.verdict": {
+      const v = p.verdict as { verdict?: string; summary?: string } | undefined;
+      what = `${p.run_id} ${p.error ? `没跑成：${p.error}` : `${v?.verdict === "pass" ? "通过" : "没通过"}：${v?.summary ?? ""}`}`; break;
+    }
     case "run.receipt": {
       const r = p.receipt as { outcome: string; summary: string };
-      what = `${p.run_id} ${r.outcome}：${r.summary}${p.session_id ? `（会话 ${p.session_id}）` : ""}`; break;
+      what = `${p.run_id} ${r.outcome}：${r.summary}${p.session_id ? `（会话 ${p.session_id}）` : ""}${p.verifier ? `，请 ${p.verifier} 验证` : ""}`; break;
     }
     case "run.heartbeat": what = String(p.run_id); break;
     case "card.answered": what = `${p.card_id} → ${p.choice ?? ""}${p.text ? `：${p.text}` : ""}`; break;
@@ -66,7 +78,7 @@ const print = (data: unknown, human: () => string) => console.log(asJson ? JSON.
 switch (cmd) {
   case "goal": {
     const text = rest.join(" ");
-    if (direct) { const r = await emit("goal.confirmed", { title: text }); print(r, () => `已立项 ${r.refs.join(" · ")}（事件 #${r.seq}），xj status 查看`); break; }
+    if (direct) { const r = await emit("goal.confirmed", { title: text, ...(checks.length ? { checks } : {}) }); print(r, () => `已立项 ${r.refs.join(" · ")}（事件 #${r.seq}），xj status 查看`); break; }
     const r = await emit("human.message", { text, via: "cli" });
     print(r, () => `收到 ${r.refs.filter((x) => x.startsWith("G-")).join("")}（事件 #${r.seq}）。主理人整理好目标卡后用 xj cards 查看，xj answer <C-x> confirm|revise|drop 回答`);
     break;

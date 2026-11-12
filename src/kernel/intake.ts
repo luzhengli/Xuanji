@@ -1,6 +1,7 @@
 // 主理人（P1-10）：把人的一句话整理成目标卡。模型的输出是资料，内核在归并时再清洗一遍，
 // 不信任里面的任何权限字段：自主级别固定 L1，预算只认合理范围内的数，其余按默认。
 import { jsonCandidates } from "./receipt.ts";
+import { normalizeChecks } from "./verdict.ts";
 import type { Draft, Goal, Grant } from "./types.ts";
 
 export const TITLE_MAX = 60;
@@ -55,6 +56,8 @@ export function normalizeDraft(obj: unknown): DraftResult {
   }
   const base = normalizeBase(r.base);
   if (base) draft.base = base;
+  const checks = normalizeChecks(r.checks);
+  if (checks.length) draft.checks = checks;
   return { ok: true, draft };
 }
 
@@ -66,13 +69,15 @@ export function normalizeBase(x: unknown): string | undefined {
 
 // 目标卡的正文：提醒（有才列）、验收、边界、授权。目标本身在卡片标题里。
 // 各段之间空一行：飞书的 markdown 不空行时，下一段的标题会接到上一段列表最后一项的末尾（2026-11-12 真实一轮看到）。
-export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"> & { base?: string | null | undefined }, notes: string[] = []): string {
+export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"> & { base?: string | null | undefined; checks?: string[] | undefined }, notes: string[] = []): string {
   const bullets = (xs: string[], none: string) => (xs.length ? xs.map((x) => `- ${x}`).join("\n") : `- ${none}`);
   return [
     ...(notes.length ? [`**提醒**\n${bullets(notes, "")}`] : []),
     `**验收**\n${bullets(g.acceptance, "（未整理，按目标本身验收）")}`,
     `**边界**\n${bullets(g.boundaries, "（无）")}`,
     ...(g.base ? [`**基底** 从 ${g.base} 拉分支（不是主干；要改在修改意见里写）`] : []),
+    // 检查命令（P2-05，2026-11-12 人定）：人确认目标卡就等于批准在任务的 worktree 里跑这些命令。
+    ...(g.checks?.length ? [`**检查命令**（确认即同意在任务的 worktree 里跑）\n${g.checks.map((c) => `- \`${c}\``).join("\n")}`] : []),
     `**授权** ${grantLine(g.grant)}`,
   ].join("\n\n");
 }
