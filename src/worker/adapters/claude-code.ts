@@ -19,8 +19,9 @@ export function buildArgs(req: RunRequest): string[] {
   if (req.session_id) args.push("--resume", req.session_id);
   if (req.model) args.push("--model", req.model);
   if (req.tools) args.push("--tools", req.tools.join(","));
+  if (req.disallowed_tools?.length) args.push("--disallowedTools", ...req.disallowed_tools);
   if (req.permission_mode) args.push("--permission-mode", req.permission_mode);
-  // --tools 能接多个值，不隔开就会把提示词也吞成工具名（2026-11-12 实测：Claude Code 收不到提示词直接报错退出）。
+  // --tools、--disallowedTools 能接多个值，不隔开就会把提示词也吞成工具名（2026-11-12 实测：Claude Code 收不到提示词直接报错退出）。
   args.push("--", req.prompt);
   return args;
 }

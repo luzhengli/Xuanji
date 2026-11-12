@@ -12,6 +12,9 @@ export function reconcileGoals(db: DB): Gap[] {
       gaps.push({ goal_id: id, kind: "goal_acceptance_pending", detail: "全部任务完成，目标验收还没跑" });
       // TODO P2：目标验收；一期一个目标一个任务，任务完成即目标完成。
       db.prepare(`UPDATE goals SET status = 'done' WHERE id = ?`).run(id);
+    } else if (states.length && states.every((s) => s === "done" || s === "stopped" || s === "abandoned")) {
+      // 任务都不再等了但没全做完（P1-24）：被人停掉或接管的记 stopped，其余（放弃）记 abandoned，不再挂在“在做”里。
+      db.prepare(`UPDATE goals SET status = ? WHERE id = ?`).run(states.includes("stopped") ? "stopped" : "abandoned", id);
     }
     // TODO P2：依赖已满足但还没派发的任务（awaiting_deps → queued）。
     // TODO P3：回执里的范围外事项还没处理。

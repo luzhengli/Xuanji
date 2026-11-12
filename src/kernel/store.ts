@@ -72,6 +72,13 @@ CREATE INDEX IF NOT EXISTS judgments_status ON judgments(status);
 CREATE TABLE IF NOT EXISTS backups (
   kind TEXT NOT NULL, ok INTEGER NOT NULL, at TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY (kind, ok)
 );
+-- 对外动作（P1-21）：先落账后执行。key 是幂等键。
+CREATE TABLE IF NOT EXISTS effects (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, params TEXT NOT NULL,
+  key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, not_before TEXT,
+  result TEXT, error TEXT, worker TEXT, instance TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS effects_status ON effects(status);
 CREATE TABLE IF NOT EXISTS quota (
   agent TEXT PRIMARY KEY, seven_day_utilization REAL, seven_day_resets_at TEXT,
   five_hour_utilization REAL, five_hour_resets_at TEXT, observed_at TEXT
@@ -89,7 +96,8 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["runs", "instance", "TEXT"],                           // 领活的接单程序实例；它重启后，旧实例的轮次即中断
   ["runs", "lost_reason", "TEXT"],
   ["event_refs", "note", "TEXT"],                         // 归并对这个编号做了什么（看门狗判中断等），给 xj why 看
-  ["cards", "form", "TEXT"],                              // 卡片样式：goal / budget / brief / reply（P1-10、P1-13、P1-17）
+  ["cards", "form", "TEXT"],
+  ["runs", "feedback", "TEXT"],                           // 这一轮领活时带走的反馈；回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）                              // 卡片样式：goal / budget / brief / reply（P1-10、P1-13、P1-17）
 ];
 
 export function openStore(path: string): DB {
@@ -117,7 +125,7 @@ export function nextId(db: DB, name: string): number {
 
 // 投影可以从事件日志重建：清空所有投影表，不动 events。
 export function clearProjections(db: DB): void {
-  for (const t of ["event_refs", "judgments", "backups", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
+  for (const t of ["event_refs", "judgments", "effects", "backups", "leases", "subscriptions", "timers", "runs", "cards", "rulings", "tasks", "goals", "counters", "quota"]) {
     db.exec(`DELETE FROM ${t}`);
   }
 }

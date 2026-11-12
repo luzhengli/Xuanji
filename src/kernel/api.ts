@@ -27,14 +27,19 @@ export function startApi(kernel: Kernel, port: number) {
         const j = kernel.claimJudgment(b.agent, b.at, b.source_id, b.worker && b.instance ? { worker: b.worker, instance: b.instance } : undefined);
         return json(res, 200, { judgment: j });
       }
+      if (route === "POST /effects/claim") {         // 接单程序领对外动作（P1-21）
+        const b = body as { at: string; source_id: string; worker?: string; instance?: string };
+        if (!b.at || !b.source_id) return json(res, 400, { error: "领对外动作要带 at、source_id" });
+        return json(res, 200, kernel.claimEffect(b.at, b.source_id, b.worker && b.instance ? { worker: b.worker, instance: b.instance } : undefined) ?? { effect: null });
+      }
       if (route === "GET /backups") return json(res, 200, kernel.backups());
       if (route === "GET /cards") return json(res, 200, kernel.cards());
       if (route === "GET /overview") return json(res, 200, kernel.overview());
-      const one = /^GET \/(goals|tasks|runs|cards|judgments)\/([^/]+)$/.exec(route);
+      const one = /^GET \/(goals|tasks|runs|cards|judgments|effects)\/([^/]+)$/.exec(route);
       if (one) {
         const id = decodeURIComponent(one[2]!);
         const found = one[1] === "goals" ? kernel.goal(id) : one[1] === "tasks" ? kernel.task(id) : one[1] === "runs" ? kernel.run(id)
-          : one[1] === "judgments" ? kernel.judgment(id) : kernel.card(id);
+          : one[1] === "judgments" ? kernel.judgment(id) : one[1] === "effects" ? kernel.effect(id) : kernel.card(id);
         return found ? json(res, 200, found) : json(res, 404, { error: `不存在 ${id}` });
       }
       if (url.pathname.startsWith("/why/")) return json(res, 200, kernel.why(decodeURIComponent(url.pathname.slice(5))));

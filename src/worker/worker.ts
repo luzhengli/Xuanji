@@ -4,10 +4,16 @@ import { parseDraft, type DraftResult } from "../kernel/intake.ts";
 import { runLimitMinutes } from "../kernel/budget.ts";
 import { buildPrompt, buildResumePrompt, buildIntakePrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
-import type { Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
+import type { Effect, Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
+import { runEffect, execReal, type Exec } from "./effects.ts";
 
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
+
+// 执行的 Agent 不能自己做对外动作：推送和改 PR 的命令禁掉，写进回执的 effects 由接单程序代为执行（P1-21）。
+// 这是尽力而为的拦截（换个写法的命令拦不住），真正的边界仍是沙箱和权限模式；查看类命令（gh pr view/list）不拦。
+export const EXECUTION_DISALLOWED = ["Bash(git push:*)", "Bash(gh pr create:*)", "Bash(gh pr merge:*)", "Bash(gh pr close:*)",
+  "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)"];
 
 export interface ClaimResult {
   task: Task;
@@ -22,6 +28,7 @@ export interface ClaimResult {
 export interface KernelClient {
   claim(agent: string): Promise<ClaimResult | { task: null }>;
   claimJudgment(agent: string): Promise<{ judgment: Judgment | null }>;
+  claimEffect(): Promise<{ effect: Effect | null; workdir?: string | null; goal_id?: string }>;
   emit(type: string, payload: Record<string, unknown>, about?: string): Promise<void>;
   goal(id: string): Promise<Goal>;
   runStatus(runId: string): Promise<string>;
@@ -33,6 +40,7 @@ export interface WorkerOptions {
   log?: (line: string) => void;
   identity?: { worker: string; instance: string } | undefined;   // 启动报到用，须与客户端领活时带的一致
   reap?: (() => string[]) | undefined;                            // 启动时清理上个实例留下的 Agent 进程
+  exec?: Exec | undefined;                                        // 对外动作用的命令执行器（测试时换成假的）
 }
 
 export class Worker {
@@ -97,6 +105,20 @@ export class Worker {
     return true;
   }
 
+  // 一次领对外动作（P1-21）：内核已落账，这里执行并把结果报回去。不起 Agent。
+  async effectOnce(): Promise<boolean> {
+    const c = await this.kernel.claimEffect();
+    if (!c.effect) return false;
+    const x = c.effect;
+    this.log(`${x.id} 执行 ${x.kind} ${x.params.branch}（${x.task_id}，第 ${x.attempts} 次）`);
+    let out;
+    try { out = await runEffect(x, c.workdir ?? this.workRoot, c.goal_id ?? "", this.opts.exec ?? execReal); }
+    catch (err) { out = { ok: false, detail: `接单程序出错：${(err as Error).message}`.slice(0, 300), retryable: true }; }
+    await this.kernel.emit("effect.result", { effect_id: x.id, ...out }, x.task_id);
+    this.log(`${x.id} ${out.ok ? `完成 ${out.ref ?? ""}` : `失败 ${out.detail}`}`);
+    return true;
+  }
+
   private async execute(agentName: string, a: ClaimResult): Promise<void> {
     const { task, run_id } = a;
     const adapter = this.adapters[agentName];
@@ -112,6 +134,7 @@ export class Worker {
       cwd: task.workdir ?? this.workRoot,                         // TODO P2：每任务一个 worktree
       model: profile.model, permission_mode: profile.permission_mode,
       timeout_ms: runLimitMinutes(task) * 60_000, label: run_id,   // 剩下的时长预算（P1-13）
+      disallowed_tools: EXECUTION_DISALLOWED,                       // 对外动作由系统代为执行（P1-21）
     };
     const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery }); // TODO P2：按范围匹配定论
 
@@ -157,7 +180,7 @@ export class Worker {
       // 回执格式错了不重做业务，只在原会话里重写最后一条消息。
       this.log(`${run_id} 回执格式错误（${parsed.error}），请 Agent 重写`);
       const retry = await adapter.run({ ...base, prompt: `回执格式错误：${parsed.error}。只重写最后一条消息为合法的回执 JSON。`,
-        session_id: res.session_id, tools: [], timeout_ms: 120_000, label: `${run_id}-rewrite` });
+        session_id: res.session_id, tools: [], disallowed_tools: undefined, timeout_ms: 120_000, label: `${run_id}-rewrite` });
       parsed = parseReceipt(retry.last_message);
     }
     const receipt: Receipt = parsed.ok ? parsed.receipt

@@ -55,7 +55,9 @@ export function renderCard(card: Card): Record<string, unknown> {
   };
 }
 
-// 回答后卡片原地改成账本里记下的结论，不能再点。
+const STATUS_TEXT: Record<Card["status"], string> = { open: "待处理", answered: "已回答", expired: "已过期", withdrawn: "已撤回", folded: "已收起" };
+
+// 回答后卡片原地改成账本里记下的结论，不能再点。撤回、收起的卡片被点到时，也按账本里的状态改掉。
 export function renderAnswered(card: Card): Record<string, unknown> {
   const a = card.answer ?? {};
   const label = card.options.find((o) => o.key === a.choice)?.label ?? a.choice ?? "";
@@ -63,7 +65,8 @@ export function renderAnswered(card: Card): Record<string, unknown> {
     a.scope && a.scope !== "task" && `**适用范围**：${SCOPES.find((s) => s.value === a.scope)?.label ?? a.scope}`].filter(Boolean).join("\n");
   return {
     schema: "2.0", config: { update_multi: true, width_mode: "default" },
-    header: { title: { tag: "plain_text", content: card.title }, subtitle: { tag: "plain_text", content: `${card.id} · 已回答` }, template: "green" },
-    body: { elements: [{ tag: "markdown", content: [card.body, verdict].filter(Boolean).join("\n\n") || "（已回答）" }] },
+    header: { title: { tag: "plain_text", content: card.title }, subtitle: { tag: "plain_text", content: `${card.id} · ${STATUS_TEXT[card.status]}` },
+      template: card.status === "answered" ? "green" : "grey" },
+    body: { elements: [{ tag: "markdown", content: [card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）" }] },
   };
 }

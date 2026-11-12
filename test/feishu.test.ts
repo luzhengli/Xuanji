@@ -127,7 +127,7 @@ test("飞书一轮：一句话 → 主理人出目标卡并推来 → 确认立�
     const goalCard = JSON.stringify(h.lark.cards[0]!.card);
     assert.match(goalCard, /目标卡：math\.mjs 新增 div\(a, b\)/);
     assert.match(goalCard, /验收\*\*\\n- div\(6, 3\) 返回 2\\n- 除以 0 抛错/);
-    assert.match(goalCard, /L1 做到可审核为止 · 预算 8 轮或 2 小时/);
+    assert.match(goalCard, /L1 做到可审核为止，可推分支、开 PR · 预算 8 轮或 2 小时/);
     assert.doesNotMatch(goalCard, /select_static|用上面这句话回答/, "目标卡没有适用范围，也没有“用这句话回答”");
 
     await h.click("xj_C_1_o0", {});        // 确认
@@ -320,5 +320,36 @@ test("真实点击（2026-11-12 第二轮）：目标卡文字框写了字再点
 test("目标卡正文各段之间空一行（飞书 markdown 不空行会把下一段标题接到上一条列表末尾）", async () => {
   const { goalCardBody } = await import("../src/kernel/intake.ts");
   const body = goalCardBody({ acceptance: ["a"], boundaries: ["b"], grant: { level: "L1", effects: [], budget: { runs: 8, minutes: 120 }, ask_first: [] } }, ["n"]);
-  assert.equal(body, "**提醒**\n- n\n\n**验收**\n- a\n\n**边界**\n- b\n\n**授权** L1 做到可审核为止 · 预算 8 轮或 2 小时 · 先问：不可逆或对外的动作");
+  assert.equal(body, "**提醒**\n- n\n\n**验收**\n- a\n\n**边界**\n- b\n\n**授权** L1 做到可审核为止 · 预算 8 轮或 2 小时 · 先问：不可逆或授权外的对外动作");
+});
+
+test("P1-25：内核重启那几秒里到的消息不丢：通道用同一个来源编号重试，内核回来后只记一次", async () => {
+  const probe = (await import("node:net")).createServer().listen(0, "127.0.0.1");
+  await once(probe, "listening");
+  const port = (probe.address() as AddressInfo).port;
+  probe.close();
+  const lark = new FakeLark();
+  const channel = new FeishuChannel({ owner_open_id: OWNER, kernel: httpKernelPort(`http://127.0.0.1:${port}`, [100, 100, 200, 400, 800]), lark, log: () => {} });
+  const msg = JSON.stringify({ message_id: "om_down", chat_type: "p2p", message_type: "text", sender_id: OWNER, content: "内核停着时说的话" });
+  const pending = channel.handle("im.message.receive_v1", msg);
+  await new Promise((r) => setTimeout(r, 300));
+  const kernel = new Kernel(DEFAULTS, ":memory:");
+  const server = startApi(kernel, port);
+  await once(server, "listening");
+  try {
+    await pending;
+    assert.equal(kernel.overview().goals.length, 1, "内核回来后入账");
+    assert.match(lark.texts[0]!, /^收到（G-1）/);
+    await channel.handle("im.message.receive_v1", msg);
+    assert.equal(kernel.overview().goals.length, 1, "重投不重复记");
+  } finally { server.close(); kernel.close(); }
+});
+
+test("撤回的卡片被点到时原地改成“已撤回”（灰色），不再显示成已回答", () => {
+  const base: Card = { id: "C-7", kind: "decision", about: "G-1", title: "目标卡：pow", body: "b", dedupe_key: "k", status: "withdrawn",
+    options: [], answer: null, external_ref: null, form: "goal", created_at: "", updated_at: "" };
+  const json = JSON.stringify(renderAnswered(base));
+  assert.match(json, /C-7 · 已撤回/);
+  assert.match(json, /"template":"grey"/);
+  assert.match(json, /已撤回\*\*：情况变了/);
 });

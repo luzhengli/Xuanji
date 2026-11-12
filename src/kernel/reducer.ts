@@ -8,7 +8,7 @@ import { assertTransition, waitingOn } from "./state.ts";
 import { BUDGET_EXTEND, overBudget, runLimitMinutes } from "./budget.ts";
 import { TITLE_MAX, goalCardBody, normalizeDraft, minutesText } from "./intake.ts";
 import type { Event, Goal, GoalStatus, Grant, Task, TaskContract, TaskState, Receipt, CardKind, CardForm, CardOption, RulingScope,
-  Draft, IntakeInput, Judgment, JudgmentKind } from "./types.ts";
+  Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect } from "./types.ts";
 
 export type Handler = (db: DB, e: Event) => void;
 
@@ -28,6 +28,13 @@ export const RUN_GRACE_MS = 300_000;
 export const JUDGMENT_TIMEOUT_MS = 300_000;
 // 备份每小时一次；最近一次成功超过 3 小时（连着 3 次没成）就出异常卡。
 export const BACKUP_STALE_MS = 3 * 3_600_000;
+// 对外动作（P1-21）：可重试的失败第 1、2 次分别隔 1 分钟、5 分钟再试，第 3 次还不行就问人；执行超过 5 分钟没结果算一次可重试的失败。
+export const EFFECT_BACKOFF_MS = [60_000, 300_000];
+export const EFFECT_TIMEOUT_MS = 300_000;
+export const SUPPORTED_EFFECTS = ["push-branch", "open-pr"];
+export const EFFECT_OPTIONS: CardOption[] = [
+  { key: "retry", label: "重试", recommended: true }, { key: "skip", label: "跳过，直接审核" }, { key: "abandon", label: "放弃" },
+];
 
 // 目标卡的三个按钮（人定 2026-11-12：确认 / 修改 / 不做，文字框写修改意见）。
 export const GOAL_OPTIONS: CardOption[] = [
@@ -52,8 +59,9 @@ export const handlers: Record<string, Handler> = {
   "human.message": (db, e) => {
     const text = String((e.payload as { text?: unknown }).text ?? "").trim();
     if (!text) return;
+    const pending = pendingGoals(db);   // 先算，不含这句话自己的目标
     const id = insertGoal(db, e, text.slice(0, TITLE_MAX), [], [], DEFAULT_GRANT, "proposed");
-    queueJudgment(db, e, "intake", id, { request: text, revision: 0 });
+    queueJudgment(db, e, "intake", id, { request: text, revision: 0, ...(pending.length ? { pending } : {}) });
   },
 
   // 判断点被领走。编号在排队时已经签发，这里只记谁在做。
@@ -106,6 +114,8 @@ export const handlers: Record<string, Handler> = {
     db.prepare(`INSERT INTO runs(id, task_id, agent, purpose, status, started_at, heartbeat_at, worker, instance) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)`)
       .run(rid, p.task_id, p.agent, p.purpose, e.at, e.at, p.worker ?? null, p.instance ?? null);
     setTaskState(db, p.task_id, "running", e.at);
+    // 记下这一轮带走的反馈：回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）。
+    db.prepare(`UPDATE runs SET feedback = (SELECT feedback FROM tasks WHERE id = ?) WHERE id = ?`).run(p.task_id, rid);
     db.prepare(`UPDATE tasks SET runs_used = runs_used + 1 WHERE id = ?`).run(p.task_id);
     link(db, e.seq, rid);
   },
@@ -131,12 +141,14 @@ export const handlers: Record<string, Handler> = {
     for (const r of runs) markLost(db, e, r.id, "接单程序重启");
     const js = db.prepare(`SELECT id FROM judgments WHERE status = 'running' AND worker = ? AND instance IS NOT ?`).all(p.worker, p.instance) as { id: string }[];
     for (const j of js) judgmentFailed(db, e, getJudgment(db, j.id)!, "接单程序重启");
+    const fx = db.prepare(`SELECT id FROM effects WHERE status = 'running' AND worker = ? AND instance IS NOT ?`).all(p.worker, p.instance) as { id: string }[];
+    for (const x of fx) effectFailed(db, e, getEffect(db, x.id)!, "接单程序重启", true);
   },
 
   // 回执到了：按六种结果决定任务去向。卡片的生成也在这里，保证与回执同事务。
   "run.receipt": (db, e) => {
     const p = e.payload as { run_id: string; task_id: string; session_id?: string; receipt: Receipt };
-    const run = db.prepare(`SELECT status FROM runs WHERE id = ?`).get(p.run_id) as { status: string } | undefined;
+    const run = db.prepare(`SELECT status, feedback FROM runs WHERE id = ?`).get(p.run_id) as { status: string; feedback: string | null } | undefined;
     // 迟到的回执（本轮已被取消，或重复投递）只记录在轮次上，不改任务状态，不出卡片。
     if (run && run.status !== "running") {
       db.prepare(`UPDATE runs SET receipt = COALESCE(receipt, ?), session_id = COALESCE(session_id, ?) WHERE id = ?`)
@@ -149,17 +161,23 @@ export const handlers: Record<string, Handler> = {
     if (p.session_id) db.prepare(`UPDATE tasks SET session_id = ? WHERE id = ?`).run(p.session_id, p.task_id);
     if (getTask(db, p.task_id)?.state !== "running") return;
     const r = p.receipt;
-    // 带给这一轮的反馈和恢复说明已经用掉；连续失败计数只在 failed 时累加。
-    db.prepare(`UPDATE tasks SET feedback = NULL, recovery = NULL, failures = CASE WHEN ? = 'failed' THEN failures + 1 ELSE 0 END WHERE id = ?`)
-      .run(r.outcome, p.task_id);
-    switch (r.outcome) {
+    // 带给这一轮的反馈和恢复说明已经用掉（只清这一轮领走的那部分反馈）；连续失败计数只在 failed 时累加。
+    const left = remainingFeedback(getTask(db, p.task_id)!.feedback, run?.feedback ?? null);
+    db.prepare(`UPDATE tasks SET feedback = ?, recovery = NULL, failures = CASE WHEN ? = 'failed' THEN failures + 1 ELSE 0 END WHERE id = ?`)
+      .run(left, r.outcome, p.task_id);
+    // 对外动作先落账（P1-21）：和回执同一个事务写进 effects，接单程序随后执行。
+    const pendingFx = requestEffects(db, e, getTask(db, p.task_id)!, p.run_id, r.effects ?? []);
+    // 只在等自己请求的对外动作（waiting 但没写 later）：等的就是系统，按 done 处理，动作做完出审核卡。
+    const outcome = r.outcome === "waiting" && pendingFx && !r.later?.length ? "done" : r.outcome;
+    if (outcome !== r.outcome) link(db, e.seq, p.task_id, "回执在等自己请求的对外动作，按做完处理");
+    switch (outcome) {
       case "done":
+        // 跑的过程中人又补充了话：不出审核卡，带着补充立即开下一轮（设计“运行途中的新输入”）。
+        if (left) { requeue(db, e, p.task_id, "回执到时已有新的补充，带着补充开下一轮"); break; }
         setTaskState(db, p.task_id, "verifying", e.at);
-        // 一期先不做独立验证者，直接出审核卡（L1）。二期接 Codex 做验证（P2）。
-        setTaskState(db, p.task_id, "awaiting_review", e.at);
-        createCard(db, e, "review", p.task_id, `审核：${r.summary}`, reviewBody(r),
-          [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
-          `review:${p.task_id}:${p.run_id}`);
+        // 一期先不做独立验证者（二期接 Codex，P2）。有对外动作就等它们做完再出审核卡，卡上带着结果。
+        if (pendingFx) { link(db, e.seq, p.task_id, `等 ${pendingFx} 个对外动作做完再出审核卡`); break; }
+        reviewCard(db, e, p.task_id, p.run_id);
         break;
       case "ask": {
         setTaskState(db, p.task_id, "awaiting_answer", e.at);
@@ -199,7 +217,8 @@ export const handlers: Record<string, Handler> = {
         break;
       }
       case "nothing":
-        setTaskState(db, p.task_id, "done", e.at);
+        if (left) requeue(db, e, p.task_id, "回执到时已有新的补充，带着补充开下一轮");
+        else setTaskState(db, p.task_id, "done", e.at);
         break;
     }
     for (const f of r.found ?? []) {
@@ -218,6 +237,25 @@ export const handlers: Record<string, Handler> = {
     setTaskState(db, p.task_id, "awaiting_world", e.at);
     const due = p.resets_at ? new Date(p.resets_at * 1000).toISOString() : dueAt(e.at, undefined, RATE_LIMIT_FALLBACK_MS);
     addTimer(db, p.task_id, due, "订阅额度重置");
+  },
+
+  // 对外动作被领走（P1-21）。
+  "effect.claimed": (db, e) => {
+    const p = e.payload as { effect_id: string; worker?: string; instance?: string };
+    db.prepare(`UPDATE effects SET status = 'running', attempts = attempts + 1, worker = ?, instance = ?, started_at = ?, finished_at = NULL WHERE id = ? AND status = 'queued'`)
+      .run(p.worker ?? null, p.instance ?? null, e.at, p.effect_id);
+  },
+
+  // 对外动作的结果。迟到的（已判超时重排）只记录。
+  "effect.result": (db, e) => {
+    const p = e.payload as { effect_id: string; ok: boolean; ref?: string; detail?: string; retryable?: boolean };
+    const x = getEffect(db, p.effect_id);
+    if (!x || x.status !== "running") return;
+    if (!p.ok) { effectFailed(db, e, x, p.detail ?? "没有说明", p.retryable === true); return; }
+    db.prepare(`UPDATE effects SET status = 'done', result = ?, error = NULL, finished_at = ? WHERE id = ?`)
+      .run(JSON.stringify({ ref: p.ref, detail: p.detail }), e.at, x.id);
+    link(db, e.seq, x.task_id, `${x.id} ${describeEffect(x)} 完成${p.ref ? `：${p.ref}` : ""}`);
+    settleEffects(db, e, x.task_id);
   },
 
   // 时间也是事件：到期的定时器把“等世界”的任务放回队列。比较的是事件自带的 at，不是内核的时钟。
@@ -245,6 +283,7 @@ export const handlers: Record<string, Handler> = {
       .run(JSON.stringify({ choice: p.choice, text: p.text, scope: p.scope }), e.at, p.card_id);
     if (card.form === "goal") { answerGoalCard(db, e, card, p); return; }
     if (card.form === "budget") { answerBudgetCard(db, e, card, p); return; }
+    if (card.form === "effect") { answerEffectCard(db, e, card, p); return; }
     if (p.text || (p.scope && p.scope !== "task")) {
       const rid = formatId("R", nextId(db, "ruling"));
       db.prepare(`INSERT INTO rulings VALUES (?, ?, ?, ?, ?, ?, 0)`)
@@ -276,6 +315,8 @@ export const handlers: Record<string, Handler> = {
     if (task && !["done", "abandoned", "stopped"].includes(task.state)) setTaskState(db, task.id, "stopped", e.at);
     for (const r of db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running'`).all(p.about) as { id: string }[]) chargeRun(db, r.id, e.at);
     db.prepare(`UPDATE runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND status = 'running'`).run(e.at, p.about);
+    // 还没执行的对外动作作废；正在执行的拦不住，结果照常记账。
+    db.prepare(`UPDATE effects SET status = 'cancelled', error = '任务被叫停', finished_at = ? WHERE task_id = ? AND status = 'queued'`).run(e.at, p.about);
     if (task) clearWaits(db, task.id);
   },
 
@@ -321,6 +362,11 @@ function watchdog(db: DB, e: Event): void {
   for (const j of js) {
     if (now - Date.parse(j.started_at) > JUDGMENT_TIMEOUT_MS) judgmentFailed(db, e, getJudgment(db, j.id)!, "判断点超时");
   }
+  // 对外动作执行太久没结果：按可重试的失败处理，接单程序重做时先查远端，做过的不会再做一遍。
+  const fx = db.prepare(`SELECT id, started_at FROM effects WHERE status = 'running'`).all() as { id: string; started_at: string }[];
+  for (const x of fx) {
+    if (now - Date.parse(x.started_at) > EFFECT_TIMEOUT_MS) effectFailed(db, e, getEffect(db, x.id)!, "执行超时", true);
+  }
 }
 
 // 轮次中断：标为 lost，任务带恢复说明回队列；知道会话编号就接上原会话。
@@ -360,6 +406,11 @@ export function reduce(db: DB, e: Event): void {
   // 引用图最小版（P1-18）：事件涉及的编号一律回写关联表。处理器签发的新编号在处理器里已经写过。
   const p = e.payload as Record<string, unknown>;
   for (const ref of [e.about, p.task_id, p.run_id, p.about]) if (typeof ref === "string") link(db, e.seq, ref);
+  if (typeof p.effect_id === "string") {
+    link(db, e.seq, p.effect_id);
+    const x = db.prepare(`SELECT task_id FROM effects WHERE id = ?`).get(p.effect_id) as { task_id: string } | undefined;
+    if (x) link(db, e.seq, x.task_id);
+  }
   if (typeof p.judgment_id === "string") {
     link(db, e.seq, p.judgment_id);
     const j = db.prepare(`SELECT about FROM judgments WHERE id = ?`).get(p.judgment_id) as { about: string } | undefined;
@@ -407,6 +458,10 @@ function setTaskState(db: DB, taskId: string, to: TaskState, at: string): void {
   if (t.state === to) return;
   assertTransition(taskId, t.state, to);
   db.prepare(`UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?`).run(to, at, taskId);
+  // 任务结束了，它还开着的待办卡片没有意义了，撤回（实测：/stop T-10 后 C-30 还在 /card 里）。知会卡留着。
+  if (["done", "abandoned", "stopped"].includes(to)) {
+    db.prepare(`UPDATE cards SET status = 'withdrawn', updated_at = ? WHERE about = ? AND status = 'open' AND kind != 'notice'`).run(at, taskId);
+  }
 }
 
 // 反馈只追加：下一轮开始前可能攒了几条（回答了问题，又追加了预算），回执到达时一起清空。
@@ -424,13 +479,21 @@ function clearWaits(db: DB, taskId: string): void {
   db.prepare(`DELETE FROM subscriptions WHERE task_id = ?`).run(taskId);
 }
 
-function reviewBody(r: Receipt): string {
-  const ev = (r.evidence ?? []).map((x) => x.check ? `${x.check} → ${x.result ?? ""}` : `${x.artifact ?? ""} ${x.ref ?? ""}`).join("；");
-  return [r.handoff ?? r.summary, ev && `证据：${ev}`].filter(Boolean).join("\n");
+function effectsLine(effects: Effect[]): string {
+  return effects.map((x) => `${describeEffect(x)}：${x.status === "done" ? (x.result?.ref ?? "完成") : `${EFFECT_STATUS[x.status]}${x.error ? `（${x.error}）` : ""}`}`).join("；");
 }
 
+function reviewBody(r: Receipt, effects: Effect[] = []): string {
+  const ev = (r.evidence ?? []).map((x) => x.check ? `${x.check} → ${x.result ?? ""}` : `${x.artifact ?? ""} ${x.ref ?? ""}`).join("；");
+  const fx = effectsLine(effects);
+  // 对外动作放在最前面：截断时先截交接说明，不截人最该看的“推到了哪、PR 在哪”。
+  return [fx && `对外动作：${fx}`, r.handoff ?? r.summary, ev && `证据：${ev}`].filter(Boolean).join("\n");
+}
+
+const EFFECT_STATUS: Record<Effect["status"], string> = { queued: "未执行", running: "执行中", done: "完成", failed: "失败", rejected: "没执行", cancelled: "作废" };
+
 // 卡片正文的长度上限，细节放证据链接。目标卡和简报要列几条，放宽一些。
-const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, alert: 600, goal: 900, reply: 900, brief: 1500 };
+const CARD_BODY_MAX: Record<CardForm | "plain", number> = { plain: 400, budget: 400, alert: 600, effect: 600, goal: 900, reply: 900, brief: 1500 };
 
 function createCard(db: DB, e: Event, kind: CardKind, about: string, title: string, body: string, options: CardOption[], dedupeKey: string,
   form: CardForm | null = null): string | null {
@@ -528,6 +591,176 @@ function answerBudgetCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void
   }
 }
 
+// ---- 审核卡 ----
+function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
+  const row = db.prepare(`SELECT receipt FROM runs WHERE id = ?`).get(runId) as { receipt: string | null } | undefined;
+  const r: Receipt = row?.receipt ? JSON.parse(row.receipt) : { outcome: "done", summary: "（没有回执）" };
+  setTaskState(db, taskId, "awaiting_review", e.at);
+  createCard(db, e, "review", taskId, `审核：${r.summary}`, reviewBody(r, effectsOfTask(db, taskId)),
+    [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
+    `review:${taskId}:${runId}`);
+}
+
+// 回执清掉的只是这一轮领走的那部分反馈（反馈只追加，所以是前缀）；之后新到的留下。
+function remainingFeedback(now: string | null, delivered: string | null): string | null {
+  if (!now) return null;
+  if (!delivered) return now;
+  if (now === delivered) return null;
+  return now.startsWith(`${delivered}\n`) ? now.slice(delivered.length + 1) : now;
+}
+
+// ---- 对外动作（P1-21）：先落账后执行 ----
+export function getEffect(db: DB, id: string): Effect | undefined {
+  const r = db.prepare(`SELECT * FROM effects WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
+  return r ? rowToEffect(r) : undefined;
+}
+function rowToEffect(r: Record<string, unknown>): Effect {
+  return { ...(r as unknown as Effect), params: JSON.parse(r.params as string), result: r.result ? JSON.parse(r.result as string) : null };
+}
+// 审核卡列这个任务做过的全部对外动作：请求它的那一轮未必是最后一轮（实测 T-9：RN-16 请求推送，RN-18 才交 done）。
+function effectsOfTask(db: DB, taskId: string): Effect[] {
+  return (db.prepare(`SELECT * FROM effects WHERE task_id = ? ORDER BY rowid`).all(taskId) as Record<string, unknown>[]).map(rowToEffect);
+}
+function effectsOfRun(db: DB, runId: string): Effect[] {
+  return (db.prepare(`SELECT * FROM effects WHERE run_id = ? ORDER BY rowid`).all(runId) as Record<string, unknown>[]).map(rowToEffect);
+}
+export function describeEffect(x: Pick<Effect, "kind" | "params">): string {
+  return x.kind === "open-pr" ? `开 PR ${x.params.branch} → ${x.params.base ?? "main"}` : x.kind === "push-branch" ? `推分支 ${x.params.remote}/${x.params.branch}` : x.kind;
+}
+
+// 回执里的对外动作请求：校验后落账。不在授权内、不认识的、分支名不带任务编号的记为 rejected（审核卡上照实列出）。
+// 返回排上队的个数。
+function requestEffects(db: DB, e: Event, t: Task, runId: string, effects: ReceiptEffect[]): number {
+  let queued = 0;
+  for (const [i, raw] of effects.slice(0, 5).entries()) {
+    const kind = String(raw?.kind ?? "");
+    const branch = String(raw?.branch ?? "").trim();
+    const params = { branch, remote: String(raw?.remote ?? "origin").trim() || "origin",
+      ...(kind === "open-pr" ? { base: String(raw?.base ?? "main").trim() || "main", title: String(raw?.title ?? "").slice(0, 200), body: String(raw?.body ?? "").slice(0, 4000) } : {}) };
+    const why = !SUPPORTED_EFFECTS.includes(kind) ? `一期只支持 ${SUPPORTED_EFFECTS.join("、")}`
+      : !t.contract.scope.effects.includes(kind) ? "不在这个目标的授权内"
+      : !/^[A-Za-z0-9._\/-]+$/.test(branch) || branch.includes("..") ? "分支名不合法"
+      : !branch.toLowerCase().includes(t.id.toLowerCase()) ? `分支名要带任务编号 ${t.id}（出身标记）`
+      : /^(main|master)$/.test(branch) || params.remote !== "origin" && !/^[A-Za-z0-9._-]+$/.test(params.remote) ? "不能推主干，远端名要合法"
+      : kind === "open-pr" && !params.title ? "开 PR 要有标题" : null;
+    const id = formatId("X", nextId(db, "effect"));
+    const key = `${runId}:${kind}:${params.remote}:${branch}`;
+    const r = db.prepare(`INSERT OR IGNORE INTO effects(id, task_id, run_id, kind, params, key, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, t.id, runId, kind || `#${i}`, JSON.stringify(params), key, why ? "rejected" : "queued", why, e.at);
+    if (!r.changes) continue;   // 同一轮回执里重复的请求
+    link(db, e.seq, id, why ? `没执行：${why}` : "落账，等接单程序执行");
+    if (!why) queued++;
+  }
+  return queued;
+}
+
+// 失败：可重试的退避后再排；不可重试或第 3 次还不行就判失败，这一轮后面的对外动作作废，问人。
+function effectFailed(db: DB, e: Event, x: Effect, reason: string, retryable: boolean): void {
+  if (retryable && x.attempts < EFFECT_BACKOFF_MS.length + 1) {
+    const due = new Date(Date.parse(e.at) + EFFECT_BACKOFF_MS[Math.min(x.attempts, EFFECT_BACKOFF_MS.length) - 1]!).toISOString();
+    db.prepare(`UPDATE effects SET status = 'queued', error = ?, not_before = ?, worker = NULL, instance = NULL, started_at = NULL WHERE id = ?`).run(reason, due, x.id);
+    link(db, e.seq, x.id, `第 ${x.attempts} 次失败（${reason}），${due} 后重试`);
+    return;
+  }
+  db.prepare(`UPDATE effects SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`).run(reason, e.at, x.id);
+  db.prepare(`UPDATE effects SET status = 'cancelled', error = '前一个对外动作失败，没有执行', finished_at = ? WHERE run_id = ? AND status = 'queued'`).run(e.at, x.run_id);
+  link(db, e.seq, x.id, `失败：${reason}`);
+  const t = getTask(db, x.task_id);
+  if (t?.state === "awaiting_world") clearWaits(db, t.id);
+  if (t?.state === "verifying" || t?.state === "awaiting_world") setTaskState(db, t.id, "blocked", e.at);
+  createCard(db, e, "decision", x.task_id, `对外动作失败：${describeEffect(x)}`,
+    `${reason}\n重试：重新执行这一轮没做成的对外动作（会先查远端，做过的不再做）。跳过：不做了，直接出审核卡。放弃：任务结束。`,
+    EFFECT_OPTIONS, `effect:${x.task_id}`, "effect");
+  link(db, e.seq, x.task_id, `${x.id} ${describeEffect(x)} 失败，问人`);
+}
+
+// 对外动作都做完了：任务在等它们（verifying）就出审核卡；
+// 回执是 waiting 的（Agent 说要等推送结果再看），把结果当反馈叫它回来接着做，不干等兜底定时器。
+function settleEffects(db: DB, e: Event, taskId: string): void {
+  const t = getTask(db, taskId);
+  if (t?.state !== "verifying" && t?.state !== "awaiting_world") return;
+  const open = db.prepare(`SELECT 1 FROM effects WHERE task_id = ? AND status IN ('queued','running')`).get(taskId);
+  if (open) return;
+  const run = db.prepare(`SELECT id FROM runs WHERE task_id = ? AND receipt IS NOT NULL ORDER BY rowid DESC LIMIT 1`).get(taskId) as { id: string };
+  if (t.state === "verifying") { reviewCard(db, e, taskId, run.id); return; }
+  const fx = effectsOfRun(db, run.id);
+  if (!fx.length) return;
+  clearWaits(db, taskId);
+  setFeedback(db, taskId, `系统已执行你请求的对外动作：${effectsLine(fx)}。据此接着做；做完了就交 done。`);
+  requeue(db, e, taskId, "请求的对外动作做完了，带着结果回队列");
+}
+
+function answerEffectCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void {
+  const t = getTask(db, card.about);
+  if (!t) return;
+  if (p.choice === "abandon") {
+    if (!["done", "abandoned", "stopped"].includes(t.state)) setTaskState(db, t.id, "abandoned", e.at);
+    return;
+  }
+  const last = db.prepare(`SELECT run_id FROM effects WHERE task_id = ? ORDER BY rowid DESC LIMIT 1`).get(t.id) as { run_id: string } | undefined;
+  if (p.choice === "retry" && last) {
+    db.prepare(`UPDATE effects SET status = 'queued', attempts = 0, not_before = NULL, error = NULL, worker = NULL, instance = NULL, started_at = NULL, finished_at = NULL
+        WHERE run_id = ? AND status IN ('failed','cancelled')`).run(last.run_id);
+    if (t.state === "blocked") setTaskState(db, t.id, "verifying", e.at);
+    link(db, e.seq, t.id, "人选重试对外动作");
+    return;
+  }
+  // 跳过：直接出审核卡，卡上照实写哪些没做成。
+  if (t.state === "blocked" && last) reviewCard(db, e, t.id, last.run_id);
+}
+
+// ---- 补充（P1-23）----
+// 在途的目标：等人确认的目标卡，以及任务还没结束的目标（含审核卡已出、等人审核的：实测 G-11 是对审核中的 G-10 的补充）。
+function pendingGoals(db: DB): PendingGoal[] {
+  const proposed = db.prepare(`SELECT id, title FROM goals WHERE status = 'proposed' ORDER BY rowid`).all() as { id: string; title: string }[];
+  const active = db.prepare(`SELECT g.id, g.title, t.id AS task, t.state FROM goals g JOIN tasks t ON t.goal_id = g.id
+      WHERE g.status = 'active' AND t.state IN ('queued','running','verifying','awaiting_world','awaiting_answer','blocked','awaiting_review') ORDER BY g.rowid`).all() as { id: string; title: string; task: string; state: string }[];
+  return [...proposed.map((g) => ({ goal: g.id, title: g.title, status: "proposed" as const })),
+    ...active.map((g) => ({ goal: g.id, title: g.title, status: "active" as const, task: g.task, ...(g.state === "awaiting_review" ? { reviewing: true } : {}) }))].slice(-10);
+}
+
+// 主理人判断这句话是对在途目标 target 的补充：这句话的目标作废（并入），补充送到 target。
+function amendGoal(db: DB, e: Event, j: Judgment, self: Goal, target: string): void {
+  const hit = j.input.pending?.find((x) => x.goal === target);
+  if (!hit) { judgmentFailed(db, e, j, `补充指向的 ${target} 不在在途目标里`); return; }
+  setGoalStatus(db, self.id, "abandoned", e.at);
+  link(db, e.seq, self.id, `是对 ${target} 的补充，并入`);
+  const text = j.input.request;
+  const g = getGoal(db, target);
+  let how: string;
+  if (g?.status === "proposed") {
+    // 撤回还开着的目标卡，带着这句话重整一张。
+    for (const c of db.prepare(`SELECT id FROM cards WHERE about = ? AND form = 'goal' AND status = 'open'`).all(target) as { id: string }[]) {
+      db.prepare(`UPDATE cards SET status = 'withdrawn', updated_at = ? WHERE id = ?`).run(e.at, c.id);
+      link(db, e.seq, c.id, `人补充了一句，撤回重整`);
+    }
+    const prev = db.prepare(`SELECT id FROM judgments WHERE about = ? AND kind = 'intake' ORDER BY rowid DESC LIMIT 1`).get(target) as { id: string } | undefined;
+    const input = prev ? getJudgment(db, prev.id)!.input : { request: g.title, revision: 0 };
+    queueJudgment(db, e, "intake", target, { request: input.request, revision: input.revision + 1, draft: draftOf(g), feedback: `人补充：${text}` });
+    how = "主理人按这句话重整目标卡，稍后发来";
+  } else {
+    const t = hit.task ? getTask(db, hit.task) : undefined;
+    if (!t || ["done", "abandoned", "stopped"].includes(t.state)) { judgmentFailed(db, e, j, `${target} 的任务已经不在做了`); return; }
+    const was = t.state;
+    setFeedback(db, t.id, `人的补充（${self.id}）：${text}`);
+    if (was === "awaiting_world") { clearWaits(db, t.id); requeue(db, e, t.id, "人补充了一句，不再等，带着补充回队列"); }
+    else if (was === "awaiting_review") {
+      // 审核时补充：等于带着这句话退回，撤回那张审核卡。
+      for (const c of db.prepare(`SELECT id FROM cards WHERE about = ? AND kind = 'review' AND status = 'open'`).all(t.id) as { id: string }[]) {
+        db.prepare(`UPDATE cards SET status = 'withdrawn', updated_at = ? WHERE id = ?`).run(e.at, c.id);
+        link(db, e.seq, c.id, "人审核时补充了一句，撤回审核卡");
+      }
+      requeue(db, e, t.id, "人审核时补充了一句，当作退回，带着补充开下一轮");
+    } else link(db, e.seq, t.id, "人补充了一句，下一轮带上");
+    how = was === "running" ? `${t.id} 这一轮跑完后带着它开下一轮` : was === "awaiting_review" ? `撤回了 ${t.id} 的审核卡，带着补充再做一轮，做完重新出审核卡` : `${t.id} 下一轮带上`;
+  }
+  createCard(db, e, "notice", self.id, `已并入 ${target}：${text.slice(0, 40)}`, `主理人判断这句话是对 ${target}（${hit.title}）的补充。${how}。`, [], `reply:${self.id}`, "reply");
+}
+
+function draftOf(g: Goal): Draft {
+  return { kind: "goal", direct: false, title: g.title, acceptance: g.acceptance, boundaries: g.boundaries, ask_first: g.grant.ask_first, budget: g.grant.budget };
+}
+
 // ---- 主理人（P1-10）----
 function queueJudgment(db: DB, e: Event, kind: JudgmentKind, about: string, input: IntakeInput): string {
   const id = formatId("J", nextId(db, "judgment"));
@@ -566,6 +799,10 @@ function judgmentFailed(db: DB, e: Event, j: Judgment, reason: string): void {
 function onIntake(db: DB, e: Event, j: Judgment, draft: Draft): void {
   const goal = getGoal(db, j.about);
   if (!goal || goal.status !== "proposed") return;
+  // 人改过的目标卡又有新的整理在排队：这次的结果已经过时，不出卡片（P1-23 并入补充时会这样）。
+  const newer = db.prepare(`SELECT 1 FROM judgments WHERE about = ? AND kind = 'intake' AND status IN ('queued','running') AND rowid > (SELECT rowid FROM judgments WHERE id = ?)`).get(goal.id, j.id);
+  if (newer) { link(db, e.seq, goal.id, `${j.id} 的结果已被后来的补充取代`); return; }
+  if (draft.kind === "amend") { amendGoal(db, e, j, goal, draft.target!); return; }
   if (draft.kind === "not_goal") {
     setGoalStatus(db, goal.id, "abandoned", e.at);
     createCard(db, e, "notice", goal.id, `主理人：${draft.reply}`, `你说的是：“${j.input.request}”。不像要系统去做的事，没有立项；要做的话换个说法再发一次。`,
@@ -598,7 +835,10 @@ function answerGoalCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void {
   if (!goal || goal.status !== "proposed") return;
   if (p.choice === "confirm") {
     const tid = activateGoal(db, e, goal.id);
-    link(db, e.seq, goal.id, `人确认目标卡，立项 ${tid}`);
+    // 确认时写的那句话是人的补充，带进第一轮（不能丢）。
+    const note = p.text?.trim();
+    if (note) setFeedback(db, tid, `人确认目标卡时补充：${note}`);
+    link(db, e.seq, goal.id, `人确认目标卡，立项 ${tid}${note ? "，带着补充" : ""}`);
   } else if (p.choice === "drop") {
     setGoalStatus(db, goal.id, "abandoned", e.at);
     link(db, e.seq, goal.id, "人选不做");

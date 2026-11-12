@@ -55,7 +55,7 @@ test("目标卡：主理人的草稿写进目标，出一张要推送的目标�
   assert.equal(card!.title, "目标卡：math.mjs 新增 div(a, b)");
   assert.deepEqual(card!.options, GOAL_OPTIONS);
   assert.equal(card!.body, goalCardBody(g));
-  assert.match(card!.body, /\*\*授权\*\* L1 做到可审核为止 · 预算 8 轮或 2 小时 · 先问：不可逆或对外的动作/);
+  assert.match(card!.body, /\*\*授权\*\* L1 做到可审核为止，可推分支、开 PR · 预算 8 轮或 2 小时 · 先问：不可逆或授权外的对外动作/);
 
   answer(k, "C-1", "confirm");
   assert.equal(k.goal("G-1")!.status, "active");
@@ -66,6 +66,14 @@ test("目标卡：主理人的草稿写进目标，出一张要推送的目标�
   assert.deepEqual(why.map((e) => e.type), ["human.message", "judgment.claimed", "judgment.result", "card.answered"], "xj why G-1 从原话一路查到确认");
   assert.match(why.at(-1)!.note ?? "", /人确认目标卡，立项 T-1/);
   assert.ok(k.why("T-1").some((e) => e.type === "card.answered"), "立任务的那次确认挂在任务上");
+});
+
+test("确认时写在输入框里的话不丢：作为补充带进第一轮（实测 G-10 的说明被丢了）", () => {
+  const k = said();
+  draft(k, DRAFT);
+  answer(k, "C-1", "confirm", "验收再加一条：cube(-2) 返回 -8");
+  assert.equal(k.task("T-1")!.feedback, "人确认目标卡时补充：验收再加一条：cube(-2) 返回 -8");
+  assert.match(k.why("G-1").at(-1)!.note ?? "", /立项 T-1，带着补充/);
 });
 
 test("修改：带着上一版和修改意见再排一次主理人；新目标卡替换旧的；改过的版本不再直接立项", () => {
@@ -174,7 +182,7 @@ test("草稿解析：围栏里的 JSON 也认；缺字段报错；预算只认�
   const ok = parseDraft("整理好了：\n```json\n" + JSON.stringify(DRAFT) + "\n```");
   assert.ok(ok.ok && ok.draft.title === DRAFT.title);
   assert.deepEqual(parseDraft('{"kind":"goal","title":"x","acceptance":[]}'), { ok: false, error: "acceptance 至少一条" });
-  assert.deepEqual(parseDraft('{"kind":"任务"}'), { ok: false, error: 'kind 必须是 "goal" 或 "not_goal"' });
+  assert.deepEqual(parseDraft('{"kind":"任务"}'), { ok: false, error: 'kind 必须是 "goal"、"not_goal" 或 "amend"' });
   assert.deepEqual(parseDraft("好的"), { ok: false, error: "没有找到 JSON 对象" });
   const wild = parseDraft(JSON.stringify({ ...DRAFT, budget: { runs: 999, minutes: 60 }, level: "L3", acceptance: ["a", "b", "c", "d", "e"], title: "长".repeat(100) }));
   assert.ok(wild.ok);
@@ -258,4 +266,94 @@ test("真实录制：主理人不给工具也看得到 git 状态；输出的草
   assert.match(d.draft.notes![0]!, /9527f52/);
   assert.deepEqual(d.draft.ask_first, ["覆盖或改写已有的 mul 实现"]);
   assert.equal(out.rate_limit?.seven_day?.utilization, 0.58);
+});
+
+// ---- P1-23 补充：主理人判断一句话是对在途目标的补充 ----
+
+test("补充等确认的目标：这句话的目标作废并入，旧目标卡撤回，带着补充重整一张；推一条“已并入”", () => {
+  const k = said("在 math.mjs 加 pow");
+  draft(k, DRAFT);                                             // G-1 的目标卡 C-1
+  k.ingest({ source: "feishu", source_id: sid(), type: "human.message", at: T0, payload: { text: "pow 也要支持小数指数" } });
+  const j = k.claimJudgment("claude", T0, sid(), A)!;
+  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: DRAFT.title, status: "proposed" }]);
+  assert.match(buildIntakePrompt(j.input), /## 在途的目标（人之前说过、还没结束的）\n- G-1（目标卡等人确认）：math\.mjs 新增 div\(a, b\)/);
+  k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
+  assert.equal(k.goal("G-2")!.status, "abandoned");
+  assert.equal(k.card("C-1")!.status, "withdrawn");
+  const re = k.claimJudgment("claude", T0, sid(), A)!;
+  assert.deepEqual([re.about, re.input.revision, re.input.feedback], ["G-1", 1, "人补充：pow 也要支持小数指数"]);
+  const reply = k.cards().find((c) => c.form === "reply")!;
+  assert.deepEqual([reply.title, reply.push], ["已并入 G-1：pow 也要支持小数指数", true]);
+});
+
+test("补充正在跑的任务：回执到时有新补充，不出审核卡，带着补充立即开下一轮；这一轮领走的反馈清掉，新补充留下", () => {
+  const k = new Kernel(DEFAULTS, ":memory:");
+  k.ingest({ source: "cli", source_id: sid(), type: "goal.confirmed", at: T0, payload: { title: "加 pow" } });
+  const c1 = k.claim("claude", T0, sid())!;
+  k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c1.run_id, task_id: "T-1", receipt: { outcome: "done", summary: "好了", handoff: "h" } } });
+  k.ingest({ source: "cli", source_id: sid(), type: "card.answered", at: T0, payload: { card_id: "C-1", choice: "return", text: "负数要报错" } });
+  const c2 = k.claim("claude", T0, sid())!;
+  assert.match(c2.feedback!, /负数要报错/);
+  said("pow 再加一条：0 的 0 次方返回 1", k);                 // G-2，跑的过程中说的
+  const j = k.claimJudgment("claude", T0, sid(), A)!;
+  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: "加 pow", status: "active", task: "T-1" }]);
+  k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
+  assert.match(k.cards().find((c) => c.form === "reply")!.body, /T-1 这一轮跑完后带着它开下一轮/);
+  k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c2.run_id, task_id: "T-1", receipt: { outcome: "done", summary: "改好了", handoff: "h" } } });
+  assert.equal(k.task("T-1")!.state, "queued", "不出审核卡，回队列");
+  assert.equal(k.cards().filter((c) => c.kind === "review").length, 0);
+  const c3 = k.claim("claude", T0, sid())!;
+  assert.equal(c3.feedback, "人的补充（G-2）：pow 再加一条：0 的 0 次方返回 1", "上一轮领走的“负数要报错”已清掉");
+});
+
+test("补充等世界的任务：不再等，带着补充回队列；补错了目标（不在在途列表里）算判断点失败", () => {
+  const k = new Kernel(DEFAULTS, ":memory:");
+  k.ingest({ source: "cli", source_id: sid(), type: "goal.confirmed", at: T0, payload: { title: "等 CI" } });
+  const c = k.claim("claude", T0, sid())!;
+  k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c.run_id, task_id: "T-1", receipt: { outcome: "waiting", summary: "等", later: [{ timeout: "2h", about: "CI" }] } } });
+  said("CI 不用等了，直接合", k);
+  draft(k, { kind: "amend", target: "G-1" });
+  assert.equal(k.task("T-1")!.state, "queued");
+  said("再改改", k);
+  const j = draft(k, { kind: "amend", target: "G-9" });
+  assert.deepEqual([k.judgment(j.id)!.status, k.judgment(j.id)!.error], ["queued", "补充指向的 G-9 不在在途目标里"]);
+});
+
+test("补充等人审核的任务：主理人看得到它；并入时撤回审核卡，当作带着补充退回，再做一轮（实测 G-11 本是对审核中 G-10 的补充）", () => {
+  const k = new Kernel(DEFAULTS, ":memory:");
+  k.ingest({ source: "cli", source_id: sid(), type: "goal.confirmed", at: T0, payload: { title: "加 cube" } });
+  const c = k.claim("claude", T0, sid())!;
+  k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c.run_id, task_id: "T-1", receipt: { outcome: "done", summary: "好了", handoff: "h" } } });
+  assert.equal(k.task("T-1")!.state, "awaiting_review");
+  said("补充：再加一个解释 cube 的 print 函数", k);
+  const j = k.claimJudgment("claude", T0, sid(), A)!;
+  assert.deepEqual(j.input.pending, [{ goal: "G-1", title: "加 cube", status: "active", task: "T-1", reviewing: true }]);
+  assert.match(buildIntakePrompt(j.input), /- G-1（做完了等人审核，任务 T-1）：加 cube/);
+  k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: j.id, output: { kind: "amend", target: "G-1" } } });
+  assert.equal(k.card("C-1")!.status, "withdrawn");
+  assert.equal(k.task("T-1")!.state, "queued");
+  assert.equal(k.task("T-1")!.feedback, "人的补充（G-2）：补充：再加一个解释 cube 的 print 函数");
+  assert.match(k.cards().find((x) => x.form === "reply")!.body, /撤回了 T-1 的审核卡，带着补充再做一轮/);
+});
+
+test("任务结束（叫停）时，它还开着的待办卡片撤回，知会卡留着（实测 /stop T-10 后 C-30 还在）", () => {
+  const k = new Kernel(DEFAULTS, ":memory:");
+  k.ingest({ source: "cli", source_id: sid(), type: "goal.confirmed", at: T0, payload: { title: "x" } });
+  const c = k.claim("claude", T0, sid())!;
+  k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c.run_id, task_id: "T-1",
+    receipt: { outcome: "ask", summary: "问", ask: [{ question: "哪个？", options: ["a", "b"] }], found: [{ title: "顺便发现" }] } } });
+  k.ingest({ source: "cli", source_id: sid(), type: "human.stop", at: T0, payload: { about: "T-1" } });
+  assert.deepEqual(k.cards().map((x) => [x.kind, x.title]), [["notice", "发现：顺便发现"]]);
+  assert.equal(k.card("C-1")!.status, "withdrawn");
+});
+
+test("主理人还在整理时人又补充：先到的整理结果过时了，不出卡片，只出按补充重整的那张", () => {
+  const k = said("加 pow");
+  const first = k.claimJudgment("claude", T0, sid(), A)!;       // J-1 在跑
+  said("pow 要支持负指数", k);                                   // G-2 → J-2
+  draft(k, { kind: "amend", target: "G-1" });                    // J-2 判为补充，排 J-3
+  k.ingest({ source: "worker", source_id: sid(), type: "judgment.result", at: T0, payload: { judgment_id: first.id, output: DRAFT } });
+  assert.equal(k.cards().filter((c) => c.form === "goal").length, 0, "J-1 的结果被取代");
+  draft(k, { ...DRAFT, title: "pow 支持负指数" });               // J-3
+  assert.deepEqual(k.cards().filter((c) => c.form === "goal").map((c) => c.title), ["目标卡：pow 支持负指数"]);
 });

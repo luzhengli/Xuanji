@@ -18,11 +18,11 @@ export function occupiesSlot(state: TaskState): boolean { return GROUP[state] ==
 const TRANSITIONS: Record<TaskState, TaskState[]> = {
   queued:          ["running", "awaiting_deps", "stopped", "abandoned"],
   running:         ["verifying", "awaiting_answer", "awaiting_world", "blocked", "queued", "stopped", "done"],
-  verifying:       ["awaiting_review", "queued", "done", "stopped"],
+  verifying:       ["awaiting_review", "queued", "blocked", "done", "stopped"],   // blocked：对外动作失败（P1-21）
   // 回队列前查预算（P1-13）：超了就转受阻出卡片，所以等人、等世界的状态都可以直接转受阻。
   awaiting_answer: ["queued", "blocked", "stopped", "abandoned"],
   awaiting_review: ["done", "queued", "blocked", "stopped"],
-  blocked:         ["queued", "abandoned", "stopped"],
+  blocked:         ["queued", "verifying", "awaiting_review", "abandoned", "stopped"],   // 对外动作失败后人选重试或跳过
   awaiting_world:  ["queued", "blocked", "stopped", "abandoned"],
   awaiting_deps:   ["queued", "stopped", "abandoned"],
   done: [], abandoned: [], stopped: [],

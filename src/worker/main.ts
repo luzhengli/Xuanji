@@ -34,6 +34,14 @@ async function main() {
   for (;;) {   // 内核可能比接单程序晚起：报到不成功就等一会儿再试，不能跳过报到直接领活
     try { await worker.start(); break; } catch (e) { console.error("[worker] 报到失败，5 秒后重试：", (e as Error).message); await new Promise((r) => setTimeout(r, POLL_MS)); }
   }
-  await Promise.all([poll("执行", (a) => worker.once(a), POLL_MS), poll("判断点", (a) => worker.judgeOnce(a), JUDGE_POLL_MS)]);
+  // 对外动作不起 Agent，也不分档案，单独一个循环（P1-21）。
+  const effects = async (): Promise<never> => {
+    for (;;) {
+      let did = false;
+      try { did = await worker.effectOnce(); } catch (e) { console.error("[worker] 对外动作", (e as Error).message); }
+      if (!did) await new Promise((r) => setTimeout(r, JUDGE_POLL_MS));
+    }
+  };
+  await Promise.all([poll("执行", (a) => worker.once(a), POLL_MS), poll("判断点", (a) => worker.judgeOnce(a), JUDGE_POLL_MS), effects()]);
 }
 main();

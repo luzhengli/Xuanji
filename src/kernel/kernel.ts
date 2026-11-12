@@ -2,13 +2,16 @@
 // ingest() 是唯一入口：追加事件、归并投影、对账，三者同一事务。
 import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
-import { reduce, getGoal, getTask, getJudgment, backupStatus } from "./reducer.ts";
+import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
 import { pickNext } from "./scheduler.ts";
 import { openCards, rowToCard } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
-import type { Card, Event, EventInput, Judgment, Receipt, Run, Task, TaskState } from "./types.ts";
+import type { Card, Effect, Event, EventInput, Judgment, Receipt, Run, Task, TaskState } from "./types.ts";
+
+// 领对外动作的结果：动作本身，加上执行时要用的工作目录和出身标记所需的编号。
+export interface EffectClaim { effect: Effect; workdir: string | null; goal_id: string; }
 
 // 领活的结果：一件任务、内核签发的轮次编号，以及这一轮要带上的反馈和上一轮回执。
 export interface Claim {
@@ -85,6 +88,23 @@ export class Kernel {
     });
   }
   judgment(id: string) { return getJudgment(this.db, id) ?? null; }
+
+  // 领对外动作（P1-21）。每个任务按落账顺序一个一个来：前一个没结束，后一个不派（先推分支再开 PR）。
+  // 退避中的（not_before 还没到）不派；比较的是接单程序给的 at，内核不读时钟。
+  claimEffect(at: string, source_id: string, who?: WorkerIdentity): EffectClaim | null {
+    return transaction(this.db, () => {
+      const heads = this.db.prepare(`SELECT id, status, not_before FROM effects e WHERE status IN ('queued','running')
+          AND rowid = (SELECT MIN(rowid) FROM effects WHERE task_id = e.task_id AND status IN ('queued','running')) ORDER BY rowid`).all() as { id: string; status: string; not_before: string | null }[];
+      const next = heads.find((h) => h.status === "queued" && (!h.not_before || Date.parse(h.not_before) <= Date.parse(at)));
+      if (!next) return null;
+      const x = getEffect(this.db, next.id)!;
+      const e = this.apply({ source: "worker", source_id, type: "effect.claimed", at, about: x.task_id, payload: { effect_id: x.id, ...(who ?? {}) } });
+      if (!e) return null;
+      const t = getTask(this.db, x.task_id)!;
+      return { effect: getEffect(this.db, x.id)!, workdir: t.workdir, goal_id: t.goal_id };
+    });
+  }
+  effect(id: string) { return getEffect(this.db, id) ?? null; }
   backups() { return backupStatus(this.db); }
 
   private lastReceipt(taskId: string): Receipt | null {

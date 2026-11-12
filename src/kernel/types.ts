@@ -27,7 +27,8 @@ export interface Grant {
   ask_first: string[];                      // 必须先问的类别
 }
 
-export type GoalStatus = "proposed" | "active" | "paused" | "done" | "abandoned";
+// stopped：任务被人停掉或接管而结束（P1-24）。
+export type GoalStatus = "proposed" | "active" | "paused" | "done" | "abandoned" | "stopped";
 
 export interface Goal {
   id: string;
@@ -102,6 +103,8 @@ export interface ReceiptEvidence { check?: string; result?: string; artifact?: s
 export interface ReceiptAsk { question: string; why?: string; options?: string[]; recommended?: string; }
 export interface ReceiptLater { on?: string; timeout?: string; about: string; }
 export interface ReceiptFound { title: string; why?: string; }
+// 要系统代为执行的对外动作（P1-21）。Agent 自己不做，写进回执；内核先落账，接单程序再执行。
+export interface ReceiptEffect { kind: string; branch?: string; base?: string; remote?: string; title?: string; body?: string; }
 
 export interface Receipt {
   outcome: Outcome;
@@ -111,6 +114,7 @@ export interface Receipt {
   ask?: ReceiptAsk[];
   later?: ReceiptLater[];
   found?: ReceiptFound[];
+  effects?: ReceiptEffect[];
   usage?: Record<string, unknown>;
 }
 
@@ -120,7 +124,8 @@ export type CardStatus = "open" | "answered" | "expired" | "withdrawn" | "folded
 
 // 卡片的样式：目标卡（主理人整理的，确认/修改/不做）、超预算卡、简报、主理人的答复。普通卡片为 null。
 // alert：异常（备份失败、演练不通过），推送；恢复正常后撤回。
-export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert";
+// effect：对外动作失败后问人（重试 / 跳过 / 放弃）。
+export type CardForm = "goal" | "budget" | "brief" | "reply" | "alert" | "effect";
 
 export interface CardOption { key: string; label: string; recommended?: boolean; needs_text?: boolean; }
 
@@ -141,14 +146,42 @@ export interface Card {
   updated_at: string;
 }
 
+// ---- 对外动作（P1-21）----
+// 先落账后执行：回执到达时与回执同事务写进 effects，接单程序领去执行，执行前先查远端，做过的不再做。
+export type EffectKind = "push-branch" | "open-pr";
+export type EffectStatus = "queued" | "running" | "done" | "failed" | "rejected" | "cancelled";
+
+export interface Effect {
+  id: string;                    // X-n
+  task_id: string;
+  run_id: string;
+  kind: string;
+  params: { branch: string; remote: string; base?: string; title?: string; body?: string };
+  key: string;                   // 幂等键：同一轮回执里重复的请求只记一次
+  status: EffectStatus;
+  attempts: number;
+  not_before: string | null;     // 退避：这之前不派
+  result: { ref?: string; detail?: string } | null;
+  error: string | null;
+  worker: string | null;
+  instance: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
 // ---- 判断点 ----
 // 研判、规划、验证、主理人对话是无状态的模型调用，经接单程序起一次不给工具的 Agent（“判断点也是一轮”）。
 // 一期只有主理人整理目标卡（intake）。轮次表的 task_id 不能为空，所以判断点单独一张表，编号 J-x。
 export type JudgmentKind = "intake";
 export type JudgmentStatus = "queued" | "running" | "finished" | "failed";
 
+// 在途的目标：主理人据此判断一句话是新目标，还是对它们的补充（P1-23）。
+export interface PendingGoal { goal: string; title: string; status: "proposed" | "active"; task?: string | undefined; reviewing?: boolean; }
+
 export interface IntakeInput {
   request: string;               // 人的原话
+  pending?: PendingGoal[] | undefined;
   revision: number;              // 第几次修改，0 是初稿
   draft?: Draft | undefined;     // 上一版目标卡
   feedback?: string | undefined; // 人的修改意见
@@ -174,7 +207,8 @@ export interface Judgment {
 
 // 主理人整理出的目标卡草稿。自主级别不在里面：权限只由人或人写的规则授予。
 export interface Draft {
-  kind: "goal" | "not_goal";
+  kind: "goal" | "not_goal" | "amend";   // amend：对在途目标 target 的补充（P1-23）
+  target?: string | undefined;
   direct: boolean;               // 小而明确，跳过确认直接立项
   title: string;
   acceptance: string[];

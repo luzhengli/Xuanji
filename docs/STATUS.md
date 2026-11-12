@@ -1,34 +1,73 @@
 # 当前状态
 
-更新于 2026-11-12（第二批备份、部署做完，三个服务已由 launchd 托管）。每次收工时整份改写，不要追加。
+更新于 2026-11-12（第三批做完：对外动作落账、补充并入、三个小项，已在飞书真实走过一轮）。每次收工时整份改写，不要追加。
 
 ## 现在在哪
 
-一期除 P1-21 外的主线都做完了。第一批（主理人、预算、简报、知会卡收起、心跳折叠）已提交为 `8fbf25a`，第二批（P1-15 备份、P1-16 部署）随后提交。`npm test` 97 个通过，`npm run typecheck` 通过（现在也查 `scripts/`）。
+一期的待办基本做完了。第一批（`8fbf25a`）和第二批（`bdbb7b7`）已经提交。第三批改动还没提交，要等人点头。`npm test` 123 个全过，`npm run typecheck` 通过。
 
-- **备份（P1-15）**：`src/ops/backup.ts` 作为来源跑在内核进程里。启动 1 分钟后备份一次，之后每小时一次，快照放在 `data/backups/`，保留 48 份。快照之后，如果上次演练通过已超过 7 天就再演练一次：在临时副本上跑完整性检查，从事件日志重建投影，逐表比对。结果报成 `backup.done`、`backup.failed`、`backup.drilled`。快照失败、超过 3 小时没有成功、演练没通过，都出推送的异常卡，恢复正常后撤回。`xj status` 和简报里有备份一行。手动备份用 `npm run backup [-- --drill]`；`npm run restore [快照]` 列出或换上快照，内核在跑时拒绝动手。
-- **部署（P1-16）**：`com.xuanji.kernel`、`com.xuanji.worker`、`com.xuanji.feishu` 已装进 `~/Library/LaunchAgents`，人点过头。接单程序名 `local`，工作目录 `~/xj-work`，是人定的，从 `/tmp/xj-real/work` 连 git 历史拷来。日志在 `data/logs/`。`node scripts/launchd.ts status` 看状态，`uninstall` 整套撤掉。
-- **真实验证**：真实账本第一次备份和演练通过，213 条事件，投影一致。`kill -9` 内核和接单程序后，launchd 在 15 秒内重新拉起，账本记下 `kernel.restarted` 和 `worker.started`。人在飞书里发 `/status`，launchd 下的飞书通道收发正常，回复里带着备份一行。
-- **人新定的**：以后用中文交流，技术词汇可用英文，已写进 AGENTS.md。
+- **P1-21 对外动作先落账后执行**
+  - 怎么走：Agent 不再自己 push 或开 PR，而是写进回执的 `effects`。内核在回执同一事务里把它们记进 `effects` 表（编号 X-x），接单程序再逐个领去执行（`src/worker/effects.ts`）。执行前先查远端，已经做过的直接算完成。
+  - 规矩：分支名要带任务编号；不强推。
+  - 失败处理：退避后重试；被拒，或第 3 次还失败，就出对外动作卡。
+  - 审核卡等对外动作都做完才出，第一行列出这个任务做过的全部对外动作。
+  - 执行轮用 `--disallowedTools` 禁掉 `git push`、`gh pr create` 等命令。
+- **P1-23 补充**：主理人能看到在途目标（等确认、在做、等审核三种），判为 `amend` 就并入目标。三种情况分别处理：
+  - 等确认：撤回旧目标卡，重整一张。
+  - 在做：作为反馈带进下一轮。
+  - 等审核：撤回审核卡，当作退回。
+- **小项**
+  - P1-24：任务结束时目标收成 `stopped` 或 `abandoned`，没回答的决策卡、审核卡一并撤回。
+  - P1-25：飞书通道和接单程序连不上内核时，用同一来源编号重试约 5 分钟。
+  - P1-26：`data/logs/` 每小时检查一次，超过 10 MB 就轮转，保留 3 份。
+- **真实一轮修掉的问题**（都补了用例）：
+  - 确认目标卡时写的说明被丢掉。
+  - 提示词里“对外动作一律先问”和授权冲突，导致推送前多问一次。
+  - Agent 交 `waiting` 等推送结果时，任务干等兜底定时器。现在动作做完就带着结果叫它回来。
+  - 主理人看不到等审核的目标，补充判断标准太保守。
+  - 叫停后卡片还挂着。
+- **真实验证**
+  - T-9 推 `xj/T-9-cube@0867370`、T-11 推 `xj/T-11-explain-cube@ffbe7cb`，都推到本地裸仓库 `~/xj-remote/work.git`。Agent 的会话里没有自己 push。
+  - G-13 并入等确认的 G-12，旧卡显示“已撤回”。
+  - T-11 的开 PR 因远端不是 GitHub 失败，出卡后人选了放弃。
+  - 每次改完都用新代码重放真实账本（813 条事件），差异只落在预期的那几行。
 
 ## 下一步
 
-1. **第三批：P1-21 对外动作先落账后执行**，排在最后、无人值守之前。要让 push、开 PR 改由接单程序代为执行，先落账再做，带幂等键重试。
-2. 小项：P1-23 目标卡待确认时的补充被当成新目标；P1-24 任务停掉或接管后目标一直 active；P1-25 内核停机时飞书消息会丢；P1-26 日志不轮转。
+1. **问人是否提交第三批**，提交信息用约定式提交。
+2. 第三批真实一轮新记的小项：
+   - P1-27：撤回的卡片在飞书里不会主动变灰。
+   - P1-28：Agent 自建的 worktree 不清理。
+   - P1-29：目标没要 PR，Agent 也会顺手开 PR。
+   - P1-30：“发现”知会卡跨任务重复。
+3. 一期出口标准“一件事从提出到验收，人不打开任何 Agent 会话”已经多次做到。剩 P1-12 真实限流没遇到。可以和人商量一期收尾、二期（并行、Codex）开工。
 
 ## 卡在哪
 
-- **整机重启后登录拉起还没验证。** 人说以后再说。到时登录后跑 `node scripts/launchd.ts status` 和 `xj status`。
-- **09:00 的自动简报还没在真实环境见过。** 今天 09:00 应收到“简报 2026-11-12”；没收到就查 `data/logs/kernel.log`。
-- 周用量读数 58%，上限 80%。Codex 订阅额度 11 月 14 日恢复。尚未配置 Git 远端。
+- **真实 GitHub PR 没测**：这是对外动作，要人指定一个能用的仓库。
+- **“等审核时补充”没在真实环境走成**：G-10 已被接受，只有离线用例。
+- **整机重启后的登录拉起没验证**：人说以后再说。
+- 09:00 的自动简报已在账本里见到：定时器 09:00:40 出 `brief.due`，C-25 五秒后送达飞书（第一批的遗留项，可以划掉）。
+- 周用量读数 63%，上限 80%。Codex 订阅额度 11 月 14 日恢复。
 
 ## 接手须知
 
 - Node 24 直接跑 `.ts`，strip-only 模式不能用构造器参数属性、enum、namespace。
-- 三个服务归 launchd 管：不要再手动 `npm run kernel` 等，否则端口冲突，接单程序也会重名。要改代码后重启，用 `launchctl kickstart -k gui/$(id -u)/com.xuanji.kernel`（worker、feishu 同理），或重跑 `node scripts/launchd.ts install --work-root ~/xj-work`。飞书通道别用 `kill -9`。
-- 内核只听 `127.0.0.1:7331`。接口：`POST /events`、`POST /runs/claim`、`POST /judgments/claim`、`GET /overview|cards|backups`、`GET /goals|tasks|runs|cards|judgments/:id`、`GET /why/:ref`。
-- 归并里的固定阈值：心跳超时 3 分钟、单轮宽限 5 分钟、判断点 5 分钟、备份超时 3 小时（`BACKUP_STALE_MS`）。
-- 测试和临时账本起内核时设 `XJ_BACKUP_MS=0` 关掉备份来源，免得往配置里的备份目录写快照。
+- 三个服务归 launchd 管：不要再手动 `npm run kernel` 等。
+  - 改代码后重启用 `launchctl kickstart -k gui/$(id -u)/com.xuanji.kernel`（worker 同理）。先重启内核再重启接单程序，否则旧接单程序可能抢先领走刚回队列的任务（实测 RN-17，被重启恢复接住了）。
+  - 飞书通道别用 `kill -9`。
+- 内核只听 `127.0.0.1:7331`。接口：
+  - `POST /events`、`POST /runs/claim`、`POST /judgments/claim`、`POST /effects/claim`
+  - `GET /overview|cards|backups`
+  - `GET /goals|tasks|runs|cards|judgments|effects/:id`、`GET /why/:ref`
+- 归并里的固定阈值：
+  - 心跳超时 3 分钟，单轮宽限 5 分钟，判断点 5 分钟。
+  - 备份超时 3 小时。
+  - 对外动作退避 1 分钟、5 分钟。
+- 改归并逻辑前后，用账本快照跑一遍 `rebuild()` 比对投影。内核启动时会重建，规则改了，历史投影跟着变。
+- 测试和临时账本起内核时设 `XJ_BACKUP_MS=0`。
 - Claude Code 即使 `--tools ""`，也把工作目录的 git 状态放进系统提示词。
-- `~/xj-work` 里 `math.mjs` 有未提交的 greet2 和 pow 改动（T-7、T-8 的目标都没要求提交）。
-- 内核启动时对账本跑 `rebuild()` 是人认可的行为；事件表只追加。
+- `~/xj-work`：
+  - 有远端 `origin` = `~/xj-remote/work.git`（本地裸仓库，不是 GitHub）。
+  - 当前分支 `feat/greet`，`math.mjs` 有未提交的 greet2、pow 改动。
+  - `/tmp/xj-T-9-cube` 等 worktree 是 Agent 建的。

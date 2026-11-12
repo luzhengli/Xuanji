@@ -26,9 +26,14 @@ export function parseDraft(lastMessage: string): DraftResult {
 export function normalizeDraft(obj: unknown): DraftResult {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) return { ok: false, error: "输出不是对象" };
   const r = obj as Record<string, unknown>;
-  const kind = r.kind === "not_goal" ? "not_goal" : r.kind === "goal" ? "goal" : null;
-  if (!kind) return { ok: false, error: 'kind 必须是 "goal" 或 "not_goal"' };
+  const kind = r.kind === "not_goal" ? "not_goal" : r.kind === "goal" ? "goal" : r.kind === "amend" ? "amend" : null;
+  if (!kind) return { ok: false, error: 'kind 必须是 "goal"、"not_goal" 或 "amend"' };
   const str = (x: unknown, max: number) => (typeof x === "string" ? x.trim().slice(0, max) : "");
+  if (kind === "amend") {
+    const target = str(r.target, 20);
+    if (!/^G-\d+$/.test(target)) return { ok: false, error: "kind=amend 时 target 要是在途目标的编号，例如 G-9" };
+    return { ok: true, draft: { kind, target, direct: false, title: "", acceptance: [], boundaries: [], ask_first: [] } };
+  }
   const list = (x: unknown, n: number) => (Array.isArray(x) ? x.map((v) => str(v, ITEM_MAX)).filter(Boolean).slice(0, n) : []);
   if (kind === "not_goal") {
     const reply = str(r.reply, 200);
@@ -65,8 +70,9 @@ export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"
 
 export function grantLine(g: Grant): string {
   const level = { L0: "L0 只提方案", L1: "L1 做到可审核为止", L2: "L2 可逆的自动收尾", L3: "L3 规则内全自动" }[g.level];
-  const ask = g.ask_first.length ? g.ask_first.join("、") : "不可逆或对外的动作";
-  return `${level} · 预算 ${g.budget.runs} 轮或 ${minutesText(g.budget.minutes)} · 先问：${ask}`;
+  const ask = g.ask_first.length ? g.ask_first.join("、") : "不可逆或授权外的对外动作";
+  const fx = g.effects.map((k) => ({ "push-branch": "推分支", "open-pr": "开 PR" }[k] ?? k)).join("、");
+  return `${level}${fx ? `，可${fx}` : ""} · 预算 ${g.budget.runs} 轮或 ${minutesText(g.budget.minutes)} · 先问：${ask}`;
 }
 
 export function minutesText(m: number): string {

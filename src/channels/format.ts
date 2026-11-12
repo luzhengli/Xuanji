@@ -44,8 +44,9 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
   const out: string[] = [];
   const { need, fyi } = splitCards(o.cards);
   out.push(`需要你：${need.length ? `${need.length} 张卡片（${opts.cardsHint}）` : "没有"}${fyi.length ? `；另有 ${fyi.length} 张知会卡` : ""}`);
-  const active = o.goals.filter((g) => g.status !== "done" && g.status !== "abandoned");
-  const done = o.goals.filter((g) => g.status === "done" || g.status === "abandoned");
+  const finished = (s: string) => s === "done" || s === "abandoned" || s === "stopped";
+  const active = o.goals.filter((g) => !finished(g.status));
+  const done = o.goals.filter((g) => finished(g.status));
   const shownDone = opts.doneLimit === undefined ? done : done.slice(-opts.doneLimit);
   for (const g of [...shownDone, ...active]) {
     out.push(`${g.id} [${g.status}] ${g.title}${g.status === "proposed" ? "（主理人整理中，或目标卡等你确认）" : ""}`);

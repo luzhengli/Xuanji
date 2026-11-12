@@ -5,6 +5,7 @@ export interface RunRequest {
   session_id?: string | undefined;   // 有则接上原会话
   model?: string | undefined;
   tools?: string[] | undefined;      // 判断点不给工具权限：[]
+  disallowed_tools?: string[] | undefined;   // 禁用的工具或命令，例如 Bash(git push:*)
   permission_mode?: string | undefined;
   timeout_ms: number;
   label?: string | undefined;        // 这一轮的名字（轮次编号），只用于日志、录制和 pid 文件

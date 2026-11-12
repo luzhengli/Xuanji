@@ -73,3 +73,14 @@ test("背压：待处理决策卡+审核卡达到上限时不再派活", () => {
   k.ingest({ source: "worker", source_id: "r", type: "run.receipt", at, payload: { run_id: "RN-1", task_id: "T-1", receipt: { outcome: "done", summary: "s", handoff: "h" } } });
   assert.equal(k.claim("claude", at, "c2"), null);
 });
+
+test("P1-24：任务被停掉或接管后目标记 stopped，放弃的记 abandoned，不再挂在“在做”里", () => {
+  const k = new Kernel(DEFAULTS, ":memory:");
+  const g = (id: string) => k.ingest({ source: "cli", source_id: id, type: "goal.confirmed", at: "2026-11-12T00:00:00Z", payload: { title: id } });
+  g("a"); g("b");
+  k.ingest({ source: "cli", source_id: "stop", type: "human.stop", at: "2026-11-12T00:01:00Z", payload: { about: "T-1" } });
+  const c = k.claim("claude", "2026-11-12T00:02:00Z", "c")!;
+  k.ingest({ source: "worker", source_id: "r", type: "run.receipt", at: "2026-11-12T00:03:00Z", payload: { run_id: c.run_id, task_id: "T-2", receipt: { outcome: "blocked", summary: "卡住" } } });
+  k.ingest({ source: "cli", source_id: "ab", type: "card.answered", at: "2026-11-12T00:04:00Z", payload: { card_id: "C-1", choice: "abandon" } });
+  assert.deepEqual(k.overview().goals.map((x) => (x as { status: string }).status), ["stopped", "abandoned"]);
+});

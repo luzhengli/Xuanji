@@ -11,6 +11,7 @@ import { renderCard, renderAnswered, parseButtonName, SCOPES } from "./cards.ts"
 import { route, HELP } from "./commands.ts";
 import { showStatus, splitCards, type Overview } from "../format.ts";
 import { localDate } from "../../sources/timer.ts";
+import { retryConn } from "../../shared/retry.ts";
 import type { Card, RulingScope } from "../../kernel/types.ts";
 
 const execFileP = promisify(execFile);
@@ -21,20 +22,27 @@ export interface KernelPort {
   get<T>(path: string): Promise<T>;
 }
 
+// 连不上内核时的重试间隔，合计约 5 分钟（P1-25）：lark-cli 不会重投已经交出来的消息和点击，
+// 所以内核重启那几秒里到的消息，只能靠通道自己等内核回来；来源编号不变，内核去重。
+export const KERNEL_RETRY_MS = [500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000, 60_000, 60_000];
+
 // 本机内核接口上的 KernelPort。来源固定为 feishu，来源编号由调用方给（飞书的 message_id、event_id），重投时内核去重。
-export function httpKernelPort(base: string): KernelPort {
+// 事件时间取人发消息那一刻（第一次尝试时），不随重试后移。
+export function httpKernelPort(base: string, retryMs: number[] = KERNEL_RETRY_MS): KernelPort {
   return {
     emit: async (type, source_id, payload, about) => {
-      const res = await fetch(`${base}/events`, { method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source: "feishu", source_id, type, at: new Date().toISOString(), about, payload }) });
-      if (!res.ok) throw new Error(`POST /events → ${res.status}`);
-      return res.json() as Promise<{ seq: number | null; duplicate: boolean; refs: string[] }>;
+      const body = JSON.stringify({ source: "feishu", source_id, type, at: new Date().toISOString(), about, payload });
+      return retryConn(async () => {
+        const res = await fetch(`${base}/events`, { method: "POST", headers: { "content-type": "application/json" }, body });
+        if (!res.ok) throw new Error(`POST /events → ${res.status}`);
+        return res.json() as Promise<{ seq: number | null; duplicate: boolean; refs: string[] }>;
+      }, retryMs);
     },
-    get: async <T>(path: string) => {
+    get: async <T>(path: string) => retryConn(async () => {
       const res = await fetch(base + path);
       if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
       return res.json() as Promise<T>;
-    },
+    }, retryMs),
   };
 }
 
