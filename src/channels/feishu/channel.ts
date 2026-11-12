@@ -50,6 +50,7 @@ export interface Lark {
   sendCard(card: Record<string, unknown>, idempotencyKey?: string): Promise<string>;   // 返回 message_id
   sendText(text: string, idempotencyKey?: string): Promise<void>;
   updateCard(token: string, card: Record<string, unknown>): Promise<void>;
+  patchCard(messageId: string, card: Record<string, unknown>): Promise<void>;   // 不靠点击、按消息编号主动改卡（P1-27）
 }
 
 // 飞书的幂等键最长 50 个字符：长连接重投同一条消息时不会重复回复。
@@ -82,6 +83,13 @@ export class LarkCli implements Lark {
   // token 30 分钟内有效，最多用 2 次；要传完整的新卡片 JSON。
   async updateCard(token: string, card: Record<string, unknown>): Promise<void> {
     await execFileP(this.cli, ["api", "POST", "/open-apis/interactive/v1/card/update", "--as", "bot", "--data", JSON.stringify({ token, card })]);
+  }
+
+  // 机器人发的卡片 14 天内可以按 message_id 改，要卡片里 update_multi = true（renderCard 都带了）。
+  async patchCard(messageId: string, card: Record<string, unknown>): Promise<void> {
+    const { stdout } = await execFileP(this.cli, ["im", "messages", "patch", "--as", "bot", "--message-id", messageId, "--data", JSON.stringify({ content: JSON.stringify(card) })]);
+    const r = JSON.parse(stdout || "{}") as { ok?: boolean; code?: number; msg?: string; error?: unknown };
+    if (r.ok === false || (typeof r.code === "number" && r.code !== 0)) throw new Error(`改卡片失败：${JSON.stringify(r.error ?? r.msg ?? r)}`);
   }
 
   private async send(args: string[], key?: string): Promise<string> {
@@ -172,6 +180,18 @@ export class FeishuChannel {
     }
   }
 
+  // 账本里已经撤回、收起，或在 xj 里回答了的卡片，飞书上还显示着按钮：主动改成现状（P1-27）。
+  // 每张卡的每个状态只改一次，改没改成都报回内核（来源编号带状态，重复报内核去重）；改不成（超过 14 天等）记下，不反复重试。
+  async refreshClosed(): Promise<void> {
+    for (const c of await this.deps.kernel.get<Card[]>("/cards/stale")) {
+      if (!c.external_ref) continue;
+      let error: string | undefined;
+      await this.deps.lark.patchCard(c.external_ref, renderAnswered(c)).catch((e) => { error = (e as Error).message.slice(0, 200); });
+      if (error) this.log(`改 ${c.id} 失败：${error}`);
+      await this.deps.kernel.emit("card.refreshed", `refreshed:${c.id}:${c.status}`, { card_id: c.id, status: c.status, ok: !error, ...(error ? { error } : {}) }, c.id);
+    }
+  }
+
   private async deliver(card: Card, key: string): Promise<void> {
     const messageId = await this.deps.lark.sendCard(renderCard(card), key);
     await this.deps.kernel.emit("card.delivered", `delivered:${messageId}`, { card_id: card.id, external_ref: messageId }, card.id);
@@ -196,8 +216,12 @@ export class FeishuChannel {
     }
     const after = await this.deps.kernel.get<Card>(`/cards/${encodeURIComponent(card.id)}`);
     if (click.token) {
-      await this.deps.lark.updateCard(click.token, after.status === "open" ? renderCard(after) : renderAnswered(after))
-        .catch((e) => this.log(`原地更新 ${card.id} 失败：${(e as Error).message}`));
+      const ok = await this.deps.lark.updateCard(click.token, after.status === "open" ? renderCard(after) : renderAnswered(after))
+        .then(() => true, (e) => { this.log(`原地更新 ${card.id} 失败：${(e as Error).message}`); return false; });
+      // 点击时已经原地改好了，告诉内核，免得补改时再改一遍。
+      if (ok && after.status !== "open") {
+        await this.deps.kernel.emit("card.refreshed", `refreshed:${after.id}:${after.status}`, { card_id: after.id, status: after.status, ok: true, via: "click" }, after.id);
+      }
     }
   }
 

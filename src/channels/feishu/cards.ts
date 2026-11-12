@@ -67,6 +67,7 @@ export function renderAnswered(card: Card): Record<string, unknown> {
     schema: "2.0", config: { update_multi: true, width_mode: "default" },
     header: { title: { tag: "plain_text", content: card.title }, subtitle: { tag: "plain_text", content: `${card.id} · ${STATUS_TEXT[card.status]}` },
       template: card.status === "answered" ? "green" : "grey" },
-    body: { elements: [{ tag: "markdown", content: [card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）" }] },
+    body: { elements: [{ tag: "markdown", content: [card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理"
+      : card.status === "folded" ? "**已收起**：已汇总进简报，不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）" }] },
   };
 }

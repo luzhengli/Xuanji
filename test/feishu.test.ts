@@ -74,6 +74,9 @@ class FakeLark implements Lark {
   }
   async sendText(text: string, key?: string) { if (key && this.keys.has(key)) return; if (key) this.keys.add(key); this.texts.push(text); }
   async updateCard(token: string, card: Record<string, unknown>) { this.updates.push({ token, card }); }
+  patches: { messageId: string; card: Record<string, unknown> }[] = [];
+  failPatch = false;
+  async patchCard(messageId: string, card: Record<string, unknown>) { if (this.failPatch) throw new Error("超过 14 天"); this.patches.push({ messageId, card }); }
 }
 
 async function setup() {
@@ -352,4 +355,50 @@ test("撤回的卡片被点到时原地改成“已撤回”（灰色），不�
   assert.match(json, /C-7 · 已撤回/);
   assert.match(json, /"template":"grey"/);
   assert.match(json, /已撤回\*\*：情况变了/);
+});
+
+test("P1-27 撤回、收起、在 xj 里回答了的卡片，通道主动在飞书上改成现状；每个状态只改一次，改不成也不反复试", async () => {
+  const h = await setup();
+  try {
+    directGoal(h.kernel, "加 div");
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "除以 0 怎么办", options: ["抛错", "返回 NaN"] }] });
+    directGoal(h.kernel, "加 mod");
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "负数取模按哪种", options: ["数学", "JS"] }] });
+    await h.channel.pushPending();
+    assert.equal(h.lark.cards.length, 2, "两张决策卡推来");
+    await h.channel.refreshClosed();
+    assert.equal(h.lark.patches.length, 0, "都还开着，不用改");
+
+    // C-1 在 xj 里回答（飞书上没点）；C-2 因为任务被叫停而撤回。
+    h.kernel.ingest({ source: "cli", source_id: "ans-1", type: "card.answered", at, payload: { card_id: "C-1", choice: "抛错" } });
+    h.kernel.ingest({ source: "cli", source_id: "stop-2", type: "human.stop", at, payload: { about: "T-2" } });
+    await h.channel.refreshClosed();
+    assert.deepEqual(h.lark.patches.map((p) => p.messageId), ["om_1", "om_2"]);
+    assert.match(JSON.stringify(h.lark.patches[0]!.card), /C-1 · 已回答.*结论\*\*：抛错/);
+    assert.match(JSON.stringify(h.lark.patches[1]!.card), /C-2 · 已撤回.*已撤回\*\*：情况变了/);
+    assert.doesNotMatch(JSON.stringify(h.lark.patches[1]!.card), /"tag":"button"/, "改过的卡片没有按钮");
+    await h.channel.refreshClosed();
+    assert.equal(h.lark.patches.length, 2, "同一状态不再改第二次");
+    assert.deepEqual(h.kernel.why("C-2").map((e) => e.type).slice(-1), ["card.refreshed"]);
+
+    // 改不成（超过 14 天等）：记下，不反复重试。
+    directGoal(h.kernel, "加 abs");
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "abs(-0) 返回什么", options: ["0", "-0"] }] });
+    await h.channel.pushPending();
+    h.kernel.ingest({ source: "cli", source_id: "stop-3", type: "human.stop", at, payload: { about: h.kernel.card("C-3")!.about } });
+    h.lark.failPatch = true;
+    await h.channel.refreshClosed();
+    await h.channel.refreshClosed();
+    assert.equal(h.kernel.staleCards().length, 0);
+    assert.match(h.kernel.why("C-3").at(-1)!.note ?? "", /飞书上没改成：超过 14 天/);
+
+    // 在飞书上点的：点击时已原地改好，不再补改。
+    h.lark.failPatch = false;
+    directGoal(h.kernel, "加 sign");
+    finishRound(h.kernel, { outcome: "ask", summary: "要问", ask: [{ question: "sign(0) 返回什么", options: ["0", "1"] }] });
+    await h.channel.pushPending();
+    await h.click("xj_C_4_o0", {});
+    await h.channel.refreshClosed();
+    assert.equal(h.lark.patches.length, 2, "点击过的卡片不补改");
+  } finally { await h.close(); }
 });

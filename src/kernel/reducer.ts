@@ -8,7 +8,7 @@ import { assertTransition, waitingOn } from "./state.ts";
 import { BUDGET_EXTEND, overBudget, runLimitMinutes } from "./budget.ts";
 import { TITLE_MAX, goalCardBody, normalizeDraft, minutesText } from "./intake.ts";
 import type { Event, Goal, GoalStatus, Grant, Task, TaskContract, TaskState, Receipt, CardKind, CardForm, CardOption, RulingScope,
-  Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect } from "./types.ts";
+  Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect, Worktree } from "./types.ts";
 
 export type Handler = (db: DB, e: Event) => void;
 
@@ -147,7 +147,9 @@ export const handlers: Record<string, Handler> = {
 
   // 回执到了：按六种结果决定任务去向。卡片的生成也在这里，保证与回执同事务。
   "run.receipt": (db, e) => {
-    const p = e.payload as { run_id: string; task_id: string; session_id?: string; receipt: Receipt };
+    const p = e.payload as { run_id: string; task_id: string; session_id?: string; receipt: Receipt; worktrees?: Worktree[] };
+    // Agent 建的 worktree 先记下（P1-28），迟到的回执也记：任务结束后要清理，审核卡上要列出。
+    if (Array.isArray(p.worktrees) && p.worktrees.length) addWorktrees(db, e, p.task_id, p.worktrees);
     const run = db.prepare(`SELECT status, feedback FROM runs WHERE id = ?`).get(p.run_id) as { status: string; feedback: string | null } | undefined;
     // 迟到的回执（本轮已被取消，或重复投递）只记录在轮次上，不改任务状态，不出卡片。
     if (run && run.status !== "running") {
@@ -223,7 +225,16 @@ export const handlers: Record<string, Handler> = {
     }
     for (const f of r.found ?? []) {
       // 范围外事项送去研判（三期）。一期只记一张知会卡。
-      createCard(db, e, "notice", p.task_id, `发现：${f.title}`, f.why ?? "", [], `found:${p.task_id}:${f.title}`);
+      const title = `发现：${f.title}`;
+      const id = createCard(db, e, "notice", p.task_id, title, f.why ?? "", [], `found:${p.task_id}:${f.title}`);
+      // 别的任务已经报过同一件事、那张还开着（P1-30，实测 C-31、C-35）：照常记下再收起，不重复打扰。
+      // 不是干脆不建：重放旧账本时卡片编号要和当初一致，后面的回答才对得上。
+      const dup = id && db.prepare(`SELECT id, about FROM cards WHERE kind = 'notice' AND status = 'open' AND title = ? AND dedupe_key LIKE 'found:%' AND id != ? ORDER BY rowid LIMIT 1`)
+        .get(title, id) as { id: string; about: string } | undefined;
+      if (id && dup) {
+        db.prepare(`UPDATE cards SET status = 'folded', updated_at = ? WHERE id = ?`).run(e.at, id);
+        link(db, e.seq, id, `和 ${dup.id}（${dup.about}）是同一件事，收起`);
+      }
     }
   },
 
@@ -248,9 +259,16 @@ export const handlers: Record<string, Handler> = {
 
   // 对外动作的结果。迟到的（已判超时重排）只记录。
   "effect.result": (db, e) => {
-    const p = e.payload as { effect_id: string; ok: boolean; ref?: string; detail?: string; retryable?: boolean };
+    const p = e.payload as { effect_id: string; ok: boolean; ref?: string; detail?: string; retryable?: boolean; skipped?: boolean };
     const x = getEffect(db, p.effect_id);
     if (!x || x.status !== "running") return;
+    // 做不了也不必问人的（远端不是 GitHub 就开不了 PR，P1-29）：记为没执行，照常往下走，审核卡上照实列出。
+    if (!p.ok && p.skipped) {
+      db.prepare(`UPDATE effects SET status = 'rejected', error = ?, finished_at = ? WHERE id = ?`).run(p.detail ?? "做不了", e.at, x.id);
+      link(db, e.seq, x.task_id, `${x.id} ${describeEffect(x)} 没执行：${p.detail ?? "做不了"}`);
+      settleEffects(db, e, x.task_id);
+      return;
+    }
     if (!p.ok) { effectFailed(db, e, x, p.detail ?? "没有说明", p.retryable === true); return; }
     db.prepare(`UPDATE effects SET status = 'done', result = ?, error = NULL, finished_at = ? WHERE id = ?`)
       .run(JSON.stringify({ ref: p.ref, detail: p.detail }), e.at, x.id);
@@ -316,13 +334,21 @@ export const handlers: Record<string, Handler> = {
     for (const r of db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running'`).all(p.about) as { id: string }[]) chargeRun(db, r.id, e.at);
     db.prepare(`UPDATE runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND status = 'running'`).run(e.at, p.about);
     // 还没执行的对外动作作废；正在执行的拦不住，结果照常记账。
-    db.prepare(`UPDATE effects SET status = 'cancelled', error = '任务被叫停', finished_at = ? WHERE task_id = ? AND status = 'queued'`).run(e.at, p.about);
+    db.prepare(`UPDATE effects SET status = 'cancelled', error = '任务被叫停', finished_at = ? WHERE task_id = ? AND status = 'queued' AND kind != 'remove-worktree'`).run(e.at, p.about);
     if (task) clearWaits(db, task.id);
   },
 
   "card.delivered": (db, e) => {
     const p = e.payload as { card_id: string; external_ref: string };
-    db.prepare(`UPDATE cards SET external_ref = ?, updated_at = ? WHERE id = ?`).run(p.external_ref, e.at, p.card_id);
+    db.prepare(`UPDATE cards SET external_ref = ?, shown = 'open', updated_at = ? WHERE id = ?`).run(p.external_ref, e.at, p.card_id);
+  },
+
+  // 飞书上的卡片已改成账本里的现状（P1-27）：撤回、收起、在 xj 里回答了的卡片，通道主动改灰后报回来。
+  // 改失败（超过 14 天不能改等）也报，记下试过，不反复重试。
+  "card.refreshed": (db, e) => {
+    const p = e.payload as { card_id: string; status: string; ok?: boolean; error?: string };
+    db.prepare(`UPDATE cards SET shown = ? WHERE id = ?`).run(p.status, p.card_id);
+    if (p.ok === false) link(db, e.seq, p.card_id, `飞书上没改成：${p.error ?? "没有说明"}`);
   },
 
   // 接单程序从 Claude Code 的 stream-json 里读到的额度读数（实测 S3 的结论）。
@@ -403,6 +429,7 @@ export function recoveryNote(runId: string, reason: string): string {
 
 export function reduce(db: DB, e: Event): void {
   handlers[e.type]?.(db, e);
+  queueCleanups(db, e);
   // 引用图最小版（P1-18）：事件涉及的编号一律回写关联表。处理器签发的新编号在处理器里已经写过。
   const p = e.payload as Record<string, unknown>;
   for (const ref of [e.about, p.task_id, p.run_id, p.about]) if (typeof ref === "string") link(db, e.seq, ref);
@@ -483,11 +510,12 @@ function effectsLine(effects: Effect[]): string {
   return effects.map((x) => `${describeEffect(x)}：${x.status === "done" ? (x.result?.ref ?? "完成") : `${EFFECT_STATUS[x.status]}${x.error ? `（${x.error}）` : ""}`}`).join("；");
 }
 
-function reviewBody(r: Receipt, effects: Effect[] = []): string {
+function reviewBody(r: Receipt, effects: Effect[] = [], worktrees: Worktree[] = []): string {
   const ev = (r.evidence ?? []).map((x) => x.check ? `${x.check} → ${x.result ?? ""}` : `${x.artifact ?? ""} ${x.ref ?? ""}`).join("；");
-  const fx = effectsLine(effects);
+  const fx = effectsLine(effects.filter((x) => x.kind !== "remove-worktree"));
+  const wt = worktrees.map((w) => `${w.path}${w.branch ? `（${w.branch}）` : ""}`).join("；");
   // 对外动作放在最前面：截断时先截交接说明，不截人最该看的“推到了哪、PR 在哪”。
-  return [fx && `对外动作：${fx}`, r.handoff ?? r.summary, ev && `证据：${ev}`].filter(Boolean).join("\n");
+  return [fx && `对外动作：${fx}`, wt && `工作区：${wt}，任务结束后清理`, r.handoff ?? r.summary, ev && `证据：${ev}`].filter(Boolean).join("\n");
 }
 
 const EFFECT_STATUS: Record<Effect["status"], string> = { queued: "未执行", running: "执行中", done: "完成", failed: "失败", rejected: "没执行", cancelled: "作废" };
@@ -596,7 +624,7 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
   const row = db.prepare(`SELECT receipt FROM runs WHERE id = ?`).get(runId) as { receipt: string | null } | undefined;
   const r: Receipt = row?.receipt ? JSON.parse(row.receipt) : { outcome: "done", summary: "（没有回执）" };
   setTaskState(db, taskId, "awaiting_review", e.at);
-  createCard(db, e, "review", taskId, `审核：${r.summary}`, reviewBody(r, effectsOfTask(db, taskId)),
+  createCard(db, e, "review", taskId, `审核：${r.summary}`, reviewBody(r, effectsOfTask(db, taskId), worktreesOf(db, taskId)),
     [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
     `review:${taskId}:${runId}`);
 }
@@ -624,8 +652,41 @@ function effectsOfTask(db: DB, taskId: string): Effect[] {
 function effectsOfRun(db: DB, runId: string): Effect[] {
   return (db.prepare(`SELECT * FROM effects WHERE run_id = ? ORDER BY rowid`).all(runId) as Record<string, unknown>[]).map(rowToEffect);
 }
+// ---- Agent 建的 worktree（P1-28）----
+// 每个任务一个隔离工作区要到二期；在那之前 Agent 自己建的 worktree 由系统记下，审核卡上列出，任务结束后清理。
+function worktreesOf(db: DB, taskId: string): Worktree[] {
+  const r = db.prepare(`SELECT worktrees FROM tasks WHERE id = ?`).get(taskId) as { worktrees: string | null } | undefined;
+  return r?.worktrees ? JSON.parse(r.worktrees) as Worktree[] : [];
+}
+function addWorktrees(db: DB, e: Event, taskId: string, reported: Worktree[]): void {
+  if (!getTask(db, taskId)) return;
+  const have = worktreesOf(db, taskId);
+  const fresh = reported.slice(0, 10).filter((w) => typeof w?.path === "string" && w.path.startsWith("/") && !have.some((h) => h.path === w.path))
+    .map((w) => ({ path: w.path, ...(typeof w.branch === "string" && w.branch ? { branch: w.branch } : {}) }));
+  if (!fresh.length) return;
+  db.prepare(`UPDATE tasks SET worktrees = ? WHERE id = ?`).run(JSON.stringify([...have, ...fresh]), taskId);
+  link(db, e.seq, taskId, `Agent 建了工作区 ${fresh.map((w) => w.path).join("、")}，任务结束后清理`);
+}
+// 每条事件归并后看一眼：结束了的任务还有没排清理的 worktree，就排上。放在这里而不是各个结束任务的地方，漏不掉。
+function queueCleanups(db: DB, e: Event): void {
+  const rows = db.prepare(`SELECT id, worktrees FROM tasks WHERE worktrees IS NOT NULL AND state IN ('done','abandoned','stopped')`).all() as { id: string; worktrees: string }[];
+  for (const t of rows) {
+    for (const w of JSON.parse(t.worktrees) as Worktree[]) {
+      const key = `cleanup:${t.id}:${w.path}`;
+      if (db.prepare(`SELECT 1 FROM effects WHERE key = ?`).get(key)) continue;
+      const run = db.prepare(`SELECT id FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1`).get(t.id) as { id: string } | undefined;
+      const id = formatId("X", nextId(db, "effect"));
+      db.prepare(`INSERT INTO effects(id, task_id, run_id, kind, params, key, status, created_at) VALUES (?, ?, ?, 'remove-worktree', ?, ?, 'queued', ?)`)
+        .run(id, t.id, run?.id ?? "", JSON.stringify({ branch: w.branch ?? "", remote: "", path: w.path }), key, e.at);
+      link(db, e.seq, id, `任务结束，清理工作区 ${w.path}`);
+      link(db, e.seq, t.id, `${id} 清理工作区 ${w.path}`);
+    }
+  }
+}
+
 export function describeEffect(x: Pick<Effect, "kind" | "params">): string {
-  return x.kind === "open-pr" ? `开 PR ${x.params.branch} → ${x.params.base ?? "main"}` : x.kind === "push-branch" ? `推分支 ${x.params.remote}/${x.params.branch}` : x.kind;
+  return x.kind === "open-pr" ? `开 PR ${x.params.branch} → ${x.params.base ?? "main"}` : x.kind === "push-branch" ? `推分支 ${x.params.remote}/${x.params.branch}`
+    : x.kind === "remove-worktree" ? `清理工作区 ${x.params.path}` : x.kind;
 }
 
 // 回执里的对外动作请求：校验后落账。不在授权内、不认识的、分支名不带任务编号的记为 rejected（审核卡上照实列出）。
@@ -663,8 +724,13 @@ function effectFailed(db: DB, e: Event, x: Effect, reason: string, retryable: bo
     return;
   }
   db.prepare(`UPDATE effects SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`).run(reason, e.at, x.id);
-  db.prepare(`UPDATE effects SET status = 'cancelled', error = '前一个对外动作失败，没有执行', finished_at = ? WHERE run_id = ? AND status = 'queued'`).run(e.at, x.run_id);
   link(db, e.seq, x.id, `失败：${reason}`);
+  if (x.kind === "remove-worktree") {
+    // 清理不掉（有没提交的改动等）：任务已经结束，不挡任何事，记一张知会卡让人自己看，不删人的东西。
+    createCard(db, e, "notice", x.task_id, `没清掉工作区 ${x.params.path}`, `${reason}\n确认里面没有要留的东西后，手动 git worktree remove。`, [], `cleanup:${x.task_id}:${x.params.path}`);
+    return;
+  }
+  db.prepare(`UPDATE effects SET status = 'cancelled', error = '前一个对外动作失败，没有执行', finished_at = ? WHERE run_id = ? AND status = 'queued' AND kind != 'remove-worktree'`).run(e.at, x.run_id);
   const t = getTask(db, x.task_id);
   if (t?.state === "awaiting_world") clearWaits(db, t.id);
   if (t?.state === "verifying" || t?.state === "awaiting_world") setTaskState(db, t.id, "blocked", e.at);

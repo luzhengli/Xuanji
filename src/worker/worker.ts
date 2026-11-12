@@ -5,7 +5,7 @@ import { runLimitMinutes } from "../kernel/budget.ts";
 import { buildPrompt, buildResumePrompt, buildIntakePrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
 import type { Effect, Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
-import { runEffect, execReal, type Exec } from "./effects.ts";
+import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
 
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
@@ -110,7 +110,7 @@ export class Worker {
     const c = await this.kernel.claimEffect();
     if (!c.effect) return false;
     const x = c.effect;
-    this.log(`${x.id} 执行 ${x.kind} ${x.params.branch}（${x.task_id}，第 ${x.attempts} 次）`);
+    this.log(`${x.id} 执行 ${x.kind} ${x.params.path ?? x.params.branch}（${x.task_id}，第 ${x.attempts} 次）`);
     let out;
     try { out = await runEffect(x, c.workdir ?? this.workRoot, c.goal_id ?? "", this.opts.exec ?? execReal); }
     catch (err) { out = { ok: false, detail: `接单程序出错：${(err as Error).message}`.slice(0, 300), retryable: true }; }
@@ -189,8 +189,10 @@ export class Worker {
   }
 
   private async receipt(a: ClaimResult, res: RunResult | null, receipt: Receipt): Promise<void> {
+    // Agent 自己建的 worktree 随回执报上去（P1-28），内核在审核卡上列出、任务结束后排清理。查不到就算了，不挡回执。
+    const worktrees = await taskWorktrees(a.task.id, a.task.workdir ?? this.workRoot, this.opts.exec ?? execReal).catch(() => []);
     await this.kernel.emit("run.receipt", { task_id: a.task.id, run_id: a.run_id, session_id: res?.session_id ?? a.task.session_id ?? undefined,
-      receipt: { ...receipt, usage: res?.usage } }, a.task.id);
+      receipt: { ...receipt, usage: res?.usage }, ...(worktrees.length ? { worktrees } : {}) }, a.task.id);
     this.log(`${a.run_id} 交回执：${receipt.outcome} ${receipt.summary}`);
   }
 

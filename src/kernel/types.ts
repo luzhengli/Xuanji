@@ -73,6 +73,7 @@ export interface Task {
   feedback: string | null;       // 下一轮要带上的人的回答或退回意见；回执到达时清空
   failures: number;              // 连续 failed 或中断的次数
   recovery: string | null;       // 上一轮中断后的恢复说明；回执到达时清空
+  worktrees?: string | null;     // Agent 在这个任务里建的 git worktree（JSON 数组，P1-28）；任务结束后清理
   created_at: string;
   updated_at: string;
 }
@@ -103,6 +104,8 @@ export interface ReceiptEvidence { check?: string; result?: string; artifact?: s
 export interface ReceiptAsk { question: string; why?: string; options?: string[]; recommended?: string; }
 export interface ReceiptLater { on?: string; timeout?: string; about: string; }
 export interface ReceiptFound { title: string; why?: string; }
+// Agent 在任务里建的 git worktree（P1-28）：接单程序每轮结束后查 git worktree list，路径或分支名带任务编号的随回执上报。
+export interface Worktree { path: string; branch?: string | undefined; }
 // 要系统代为执行的对外动作（P1-21）。Agent 自己不做，写进回执；内核先落账，接单程序再执行。
 export interface ReceiptEffect { kind: string; branch?: string; base?: string; remote?: string; title?: string; body?: string; }
 
@@ -142,13 +145,15 @@ export interface Card {
   external_ref: string | null;   // 飞书 message_id
   form: CardForm | null;
   push?: boolean;                // 内核定的：要不要主动推给人（注意力调度），只在读出时算，不入库
+  shown?: string | null;         // 飞书上最后一次显示的状态（P1-27）；和 status 不一致时，通道主动把卡片改成现状
   created_at: string;
   updated_at: string;
 }
 
 // ---- 对外动作（P1-21）----
 // 先落账后执行：回执到达时与回执同事务写进 effects，接单程序领去执行，执行前先查远端，做过的不再做。
-export type EffectKind = "push-branch" | "open-pr";
+// remove-worktree 不是对外动作，是任务结束后清理 Agent 建的 git worktree（P1-28），借同一套落账、领取、重试。
+export type EffectKind = "push-branch" | "open-pr" | "remove-worktree";
 export type EffectStatus = "queued" | "running" | "done" | "failed" | "rejected" | "cancelled";
 
 export interface Effect {
@@ -156,7 +161,7 @@ export interface Effect {
   task_id: string;
   run_id: string;
   kind: string;
-  params: { branch: string; remote: string; base?: string; title?: string; body?: string };
+  params: { branch: string; remote: string; base?: string; title?: string; body?: string; path?: string };
   key: string;                   // 幂等键：同一轮回执里重复的请求只记一次
   status: EffectStatus;
   attempts: number;

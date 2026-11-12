@@ -63,4 +63,5 @@ export const RECEIPT_INSTRUCTIONS = `
 - {"kind": "open-pr", "branch": "<分支名>", "base": "main", "title": "<标题>", "body": "<描述>"}（先推分支再开 PR，两个都要写）
 分支名必须带任务编号（例如 xj/T-12-pow），不能是 main 或 master；只能请求“允许的对外动作”里列出的种类。
 “允许的对外动作”里的种类已经授权，不用再出 ask 问人；请求了 effects、活也做完了，outcome 就写 done，不要写 waiting。
+授权是上限，不是要做的事：目标和验收里没要求推送或开 PR，就不要请求；只要求推分支的，不要顺手开 PR。
 `;

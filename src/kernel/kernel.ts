@@ -113,6 +113,11 @@ export class Kernel {
   }
 
   cards() { return openCards(this.db); }
+  // 飞书上还显示着旧状态的卡片（P1-27）：已经送达，账本里不再是 open，飞书上还没改过来。
+  staleCards(): Card[] {
+    return (this.db.prepare(`SELECT * FROM cards WHERE external_ref IS NOT NULL AND status != 'open' AND shown IS NOT status ORDER BY rowid LIMIT 20`)
+      .all() as Record<string, unknown>[]).map(rowToCard);
+  }
   // 单张卡片，不论是否已回答。飞书点击后据此把卡片原地改成账本里记下的结论。
   card(id: string): Card | null {
     const r = this.db.prepare(`SELECT * FROM cards WHERE id = ?`).get(id) as Record<string, unknown> | undefined;

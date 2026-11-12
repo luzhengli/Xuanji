@@ -96,8 +96,10 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["runs", "instance", "TEXT"],                           // 领活的接单程序实例；它重启后，旧实例的轮次即中断
   ["runs", "lost_reason", "TEXT"],
   ["event_refs", "note", "TEXT"],                         // 归并对这个编号做了什么（看门狗判中断等），给 xj why 看
-  ["cards", "form", "TEXT"],
-  ["runs", "feedback", "TEXT"],                           // 这一轮领活时带走的反馈；回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）                              // 卡片样式：goal / budget / brief / reply（P1-10、P1-13、P1-17）
+  ["cards", "form", "TEXT"],                              // 卡片样式：goal / budget / brief / reply 等（P1-10、P1-13、P1-17）
+  ["runs", "feedback", "TEXT"],                           // 这一轮领活时带走的反馈；回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）
+  ["tasks", "worktrees", "TEXT"],                         // Agent 建的 git worktree（JSON 数组，P1-28），任务结束后清理
+  ["cards", "shown", "TEXT"],                             // 飞书上最后一次显示的状态（P1-27）
 ];
 
 export function openStore(path: string): DB {

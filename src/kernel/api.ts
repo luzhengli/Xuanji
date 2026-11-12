@@ -34,6 +34,7 @@ export function startApi(kernel: Kernel, port: number) {
       }
       if (route === "GET /backups") return json(res, 200, kernel.backups());
       if (route === "GET /cards") return json(res, 200, kernel.cards());
+      if (route === "GET /cards/stale") return json(res, 200, kernel.staleCards());   // 飞书上要改过来的卡片（P1-27）
       if (route === "GET /overview") return json(res, 200, kernel.overview());
       const one = /^GET \/(goals|tasks|runs|cards|judgments|effects)\/([^/]+)$/.exec(route);
       if (one) {

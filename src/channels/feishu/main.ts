@@ -15,11 +15,12 @@ lark.listen("im.message.receive_v1", (line) => channel.handle("im.message.receiv
 lark.listen("card.action.trigger", (line) => channel.handle("card.action.trigger", line));
 console.log(`[feishu] 只认 ${cfg.owner_open_id}，内核 ${base}`);
 
-// 补发：账本里还没送达的决策卡推给你。
+// 补发：账本里还没送达的决策卡推给你；已经关闭的卡片在飞书上改成现状（P1-27）。
 // 内核停着时一次补发可能在重试里等好几分钟（P1-25），上一次没完就跳过这一轮，免得越积越多。
 let pushing = false;
 setInterval(() => {
   if (pushing) return;
   pushing = true;
-  channel.pushPending().catch((e) => console.error("[feishu]", (e as Error).message)).finally(() => { pushing = false; });
+  channel.pushPending().then(() => channel.refreshClosed())
+    .catch((e) => console.error("[feishu]", (e as Error).message)).finally(() => { pushing = false; });
 }, 10_000);
