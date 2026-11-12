@@ -149,7 +149,12 @@ export interface Receipt {
   found?: ReceiptFound[];
   effects?: ReceiptEffect[];
   usage?: Record<string, unknown>;
+  changes?: ReceiptChanges;   // 接单程序填的，不是 Agent 写的（Agent 写了也会被覆盖）
 }
+
+// 这一轮交 done 时工作区相对基底改了哪些文件（审核卡“结果”一段用）。接单程序用 git 算，不靠执行者自己说。
+// status 取 git diff --name-status 的首字母：A 新增、M 修改、D 删除；uncommitted 是 git status 里还没提交的路径。
+export interface ReceiptChanges { base: string; files: { status: string; path: string }[]; uncommitted: string[]; }
 
 // ---- 卡片 ----
 export type CardKind = "decision" | "review" | "notice";

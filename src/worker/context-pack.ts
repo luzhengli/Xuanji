@@ -138,7 +138,7 @@ ${v.shell === false ? "- 结论要有依据：读到的代码、diff 和检查�
 - 没有问题写 pass，有一个就写 fail。拿不准是不是问题的，不算问题，写进残余风险。
 - 残余风险必须列，至少一条：你没核实到的、验收标准没覆盖但可能出问题的地方。人会在审核卡上原样看到。`);
   parts.push(`## 输出
-最后一条消息必须是、且只能是一个 JSON 对象，例如：
+最后一条消息必须是、且只能是一个 JSON 对象，summary、problem、risks 用中文写（代码、命令、文件名照旧），例如：
 {"verdict":"pass","summary":"一句话结论","issues":[],"risks":["…"]}
 {"verdict":"fail","summary":"一句话结论","issues":[{"criterion":"违反的验收标准","problem":"问题","where":"math.mjs:3"}],"risks":["…"]}`);
   return parts.join("\n\n");

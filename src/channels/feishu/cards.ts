@@ -30,8 +30,15 @@ const PLACEHOLDER = (card: Card): string =>
       : card.form === "ruling" ? "想交代给 Agent 的话（可选）"
       : card.kind === "decision" ? "选项都不合适时写一句话（可选）" : "退回或接管时写意见（可选）";
 
+// 正文按空行拆成几段，每段一个 markdown 元素。飞书在同一个元素里，列表后面即使空了一行，
+// 下一段也会压到列表最后一项上（2026-11-13 人截图 C-42）；拆开后段与段之间由元素间距隔开。
+export function bodyElements(body: string): { tag: "markdown"; content: string }[] {
+  const parts = body.split(/\n{2,}/).map((x) => x.trim()).filter(Boolean);
+  return (parts.length ? parts : ["（无正文）"]).map((content) => ({ tag: "markdown", content }));
+}
+
 export function renderCard(card: Card): Record<string, unknown> {
-  const elements: unknown[] = [{ tag: "markdown", content: card.body || "（无正文）" }];
+  const elements: unknown[] = bodyElements(card.body);
   if (card.kind !== "notice") {
     // 目标卡和超预算卡的回答就是按钮本身，不落成定论，所以没有适用范围，也没有“用这句话回答”。
     const plainDecision = card.kind === "decision" && !card.form;
@@ -70,8 +77,8 @@ export function renderAnswered(card: Card): Record<string, unknown> {
     schema: "2.0", config: { update_multi: true, width_mode: "default" },
     header: { title: { tag: "plain_text", content: card.title }, subtitle: { tag: "plain_text", content: `${card.id} · ${STATUS_TEXT[card.status]}` },
       template: card.status === "answered" ? "green" : "grey" },
-    body: { elements: [{ tag: "markdown", content: [card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理"
-      : card.status === "folded" ? "**已收起**：已汇总进简报，不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）" }] },
+    body: { elements: bodyElements([card.body, verdict || (card.status === "withdrawn" ? "**已撤回**：情况变了（例如你补充了一句、问题已经不用答），不用再处理"
+      : card.status === "folded" ? "**已收起**：已汇总进简报，不用再处理" : "")].filter(Boolean).join("\n\n") || "（已回答）") },
   };
 }
 
@@ -89,7 +96,7 @@ export function renderRulings(rulings: Ruling[], note = ""): Record<string, unkn
   const lines = shown.map((r) => `**${r.id}**（${scope(r.scope)} · ${r.decided_at.slice(0, 10)} · 出处 ${r.origin}${r.scope_ref ? ` · ${r.scope_ref}` : ""}）\n${r.text}`);
   const body = [note, lines.length ? lines.join("\n\n") : "没有生效中的定论。",
     rulings.length > shown.length ? `另有 ${rulings.length - shown.length} 条更早的，用 xj rulings 看。` : ""].filter(Boolean).join("\n\n");
-  const elements: unknown[] = [{ tag: "markdown", content: body }];
+  const elements: unknown[] = bodyElements(body);
   if (shown.length) {
     elements.push({ tag: "form", name: "rulings", elements: shown.map((r) => ({
       tag: "button", name: `xj_rv_${r.id.replace("-", "_")}`, form_action_type: "submit",

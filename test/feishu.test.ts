@@ -441,3 +441,12 @@ test("P2-07：/rulings 列出生效中的定论，点“作废”落账并原地
     assert.deepEqual(h.kernel.rulings().map((r) => r.id), ["R-2"]);
   } finally { await h.close(); }
 });
+
+test("卡片正文按空行拆成几个 markdown 元素：飞书在同一个元素里列表后空一行也会把下一段压到最后一项上（2026-11-13 人截图 C-42）", () => {
+  const card = { id: "C-9", kind: "review", about: "T-1", title: "审核：x", body: "**残余风险**\n- a\n- b\n\n**结果**\n- 分支 `xj/T-1`\n\n\n**执行者说明**\n好了", options: [{ key: "accept", label: "接受" }],
+    dedupe_key: "", status: "open", answer: null, external_ref: null, form: null, created_at: at, updated_at: at } as Card;
+  const els = (renderCard(card).body as { elements: { tag: string; content?: string }[] }).elements;
+  assert.deepEqual(els.filter((e) => e.tag === "markdown").map((e) => e.content), ["**残余风险**\n- a\n- b", "**结果**\n- 分支 `xj/T-1`", "**执行者说明**\n好了"]);
+  const done = (renderAnswered({ ...card, status: "answered", answer: { choice: "accept" } }).body as { elements: { content: string }[] }).elements;
+  assert.deepEqual(done.map((e) => e.content), ["**残余风险**\n- a\n- b", "**结果**\n- 分支 `xj/T-1`", "**执行者说明**\n好了", "**结论**：接受"]);
+});

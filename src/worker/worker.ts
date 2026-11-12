@@ -6,7 +6,7 @@ import { parsePlan, DEFAULT_MAX_TASKS, type PlanResult } from "../kernel/plan.ts
 import { runLimitMinutes } from "../kernel/budget.ts";
 import { buildPrompt, buildResumePrompt, buildIntakePrompt, buildVerifyPrompt, buildPlanPrompt } from "./context-pack.ts";
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
-import type { CheckResult, Effect, Goal, IntakeInput, Judgment, PlanInput, Receipt, Ruling, Task, Verdict, Worktree } from "../kernel/types.ts";
+import type { CheckResult, Effect, Goal, IntakeInput, Judgment, PlanInput, Receipt, ReceiptChanges, Ruling, Task, Verdict, Worktree } from "../kernel/types.ts";
 import type { DepOutput } from "../kernel/kernel.ts";
 import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
 import { prepareWorkspace, staleProcesses, type Workspace } from "./workspace.ts";
@@ -235,7 +235,7 @@ export class Worker {
 
   // 这一轮在哪个目录里做（P2-02）。第一轮之前建 worktree 并落账；以后每轮用账本里记的那个，被删了就在原分支上重建。
   // 二期之前就开始了的任务（已经有会话、没有 worktree）照旧在 workRoot 里做：换目录会接不上原会话。
-  private async workspaceFor(a: ClaimResult): Promise<{ cwd: string; ws: Workspace | null }> {
+  private async workspaceFor(a: ClaimResult): Promise<{ cwd: string; ws: Workspace | null; base_commit?: string }> {
     const { task } = a;
     const root = this.opts.worktreeRoot;
     const fresh = !task.workdir && !task.session_id && !a.previous;
@@ -252,15 +252,15 @@ export class Worker {
     const report = task.contract.role === "merge" && up?.base_commit ? { ...ws, base: `${ws.base}（目标基底 ${up.base_commit.slice(0, 7)}）`, base_commit: up.base_commit } : ws;
     await this.kernel.emit("workspace.prepared", { task_id: task.id, run_id: a.run_id, ...report }, task.id);
     this.log(`${a.run_id} 工作区 ${ws.path}（${ws.branch}，基底 ${ws.base}@${ws.base_commit.slice(0, 7)}）`);
-    return { cwd: ws.path, ws };
+    return { cwd: ws.path, ws, base_commit: report.base_commit };
   }
 
   private async execute(agentName: string, a: ClaimResult): Promise<void> {
     const { run_id } = a;
     const adapter = this.adapters[agentName];
     if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
-    const { cwd, ws } = await this.workspaceFor(a);
-    const task: Task = { ...a.task, workdir: cwd === this.workRoot && !a.task.workdir ? null : cwd };
+    const { cwd, ws, base_commit } = await this.workspaceFor(a);
+    const task: Task = { ...a.task, workdir: cwd === this.workRoot && !a.task.workdir ? null : cwd, base_commit: base_commit ?? a.task.base_commit ?? null };
     // 同一个工作区里还有别的进程（被判中断的上一轮的 Agent 还没停）：不起这一轮，免得两个 Agent 同时改一个目录（P2-03）。
     if (task.workdir && this.opts.worktreeRoot) {
       const stale = await staleProcesses(task.workdir, this.opts.exec ?? execReal).catch(() => []);
@@ -332,7 +332,7 @@ export class Worker {
     }
     const receipt: Receipt = parsed.ok ? parsed.receipt
       : { outcome: "failed", summary: `回执无法解析：${parsed.error}${res.exit_code ? `；退出码 ${res.exit_code}，${res.stderr.trim().slice(-200)}` : ""}` };
-    await this.receipt(a, res, receipt);
+    await this.receipt(a, res, receipt, task);
   }
 
   // 验证一轮（P2-05）：先在任务的 worktree 里跑检查命令（便宜的先跑），没过就不请验证者；过了再起只读的验证者。
@@ -430,11 +430,16 @@ export class Worker {
     return { stop, beat, clear: () => clearInterval(hb) };
   }
 
-  private async receipt(a: ClaimResult, res: RunResult | null, receipt: Receipt): Promise<void> {
+  private async receipt(a: ClaimResult, res: RunResult | null, receipt: Receipt, task: Task = a.task): Promise<void> {
+    const exec = this.opts.exec ?? execReal;
+    const here = task.workdir && existsSync(task.workdir) ? task.workdir : null;
     // Agent 自己建的 worktree 随回执报上去（P1-28），内核在审核卡上列出、任务结束后排清理。查不到就算了，不挡回执。
-    const worktrees = await taskWorktrees(a.task.id, a.task.workdir && existsSync(a.task.workdir) ? a.task.workdir : this.workRoot, this.opts.exec ?? execReal).catch(() => []);
+    const worktrees = await taskWorktrees(a.task.id, here ?? this.workRoot, exec).catch(() => []);
+    // 做完了：相对基底改了哪些文件，审核卡“结果”一段用（系统算的，Agent 写的不算）。只在系统建的工作区里算。
+    const { changes: _agentSaid, ...rest } = receipt;
+    const changes = receipt.outcome === "done" && here && task.base_commit ? await workspaceChanges(here, task.base_commit, exec).catch(() => null) : null;
     await this.kernel.emit("run.receipt", { task_id: a.task.id, run_id: a.run_id, session_id: res?.session_id ?? a.task.session_id ?? undefined,
-      receipt: { ...receipt, usage: res?.usage }, ...(worktrees.length ? { worktrees } : {}) }, a.task.id);
+      receipt: { ...rest, usage: res?.usage, ...(changes ? { changes } : {}) }, ...(worktrees.length ? { worktrees } : {}) }, a.task.id);
     this.log(`${a.run_id} 交回执：${receipt.outcome} ${receipt.summary}`);
   }
 
@@ -466,4 +471,16 @@ export async function repoFiles(cwd: string, exec: Exec): Promise<string[]> {
   if (!r || r.code) return [];
   const all = r.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
   return all.length > PLAN_FILES_MAX ? [...all.slice(0, PLAN_FILES_MAX), `…另有 ${all.length - PLAN_FILES_MAX} 个`] : all;
+}
+
+// 相对基底改了哪些文件（已提交的），以及还有哪些没提交。不是 git 仓库、基底不对返回 null。最多列 50 个。
+export async function workspaceChanges(cwd: string, base: string, exec: Exec): Promise<ReceiptChanges | null> {
+  if (!/^[0-9a-f]{7,40}$/.test(base)) return null;
+  const d = await exec("git", ["diff", "--name-status", "--no-renames", base, "HEAD"], cwd).catch(() => null);
+  if (!d || d.code) return null;
+  const files = d.stdout.split("\n").map((l) => l.split("\t")).filter((x) => x.length >= 2 && x[0])
+    .map(([st, path]) => ({ status: st!.slice(0, 1), path: path! })).slice(0, 50);
+  const st = await exec("git", ["status", "--porcelain"], cwd).catch(() => null);
+  const uncommitted = (st?.code ? "" : st?.stdout ?? "").split("\n").filter((l) => l.trim()).map((l) => l.slice(3)).slice(0, 50);
+  return { base, files, uncommitted };
 }

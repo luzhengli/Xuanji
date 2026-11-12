@@ -199,7 +199,9 @@ test("P2-02：workspace.prepared 记进 tasks.workdir；接受后排清理，在
   assert.equal(k.task("T-1")!.workdir, "/w/xj-worktrees/work/T-1");
   assert.ok(k.why("T-1").some((e) => e.note === "工作区 /w/xj-worktrees/work/T-1，分支 xj/T-1-pow，基底 main@abc1234"));
   receipt(k, c.run_id, "T-1", "done");
-  assert.match(k.cards()[0]!.body, /工作区：\/w\/xj-worktrees\/work\/T-1（xj\/T-1-pow），任务结束后清理/);
+  // 系统建的工作区不上审核卡（接受后就清掉，对人没用），只列分支（2026-11-13 改）。
+  assert.match(k.cards()[0]!.body, /^\*\*结果\*\*\n- 分支 `xj\/T-1-pow`，没推送\n\n\*\*执行者说明\*\*/);
+  assert.doesNotMatch(k.cards()[0]!.body, /\/w\/xj-worktrees/);
   ev(k, "card.answered", { card_id: k.cards()[0]!.id, choice: "accept" }, "feishu");
   const x = k.effect("X-1")!;
   assert.equal(x.kind, "remove-worktree");

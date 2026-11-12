@@ -55,6 +55,8 @@ export const RECEIPT_INSTRUCTIONS = `
 - later: [{on, timeout, about}]（在等外部事件时）
 - found: [{title, why}]（发现的范围外事项，不要自己去做）
 - effects: 要系统代为执行的对外动作（见下）
+summary、handoff、ask 用中文写（代码、命令、文件名、报错原文照旧）。handoff 是写给接手的人看的，几句话说清，不要贴大段输出；
+改了哪些文件、推没推，系统会自己列出，不用重复。
 
 ## 对外动作由系统代为执行
 不要自己 git push、gh pr create（这些命令已被禁用）。要推分支或开 PR，就在本地提交好，把请求写进回执的 effects，

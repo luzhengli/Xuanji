@@ -420,4 +420,35 @@ test("出口（离线）：两个子任务各在自己的 worktree 从 main 拉�
   const vp = buildVerifyPrompt({ task: vc.task, goal: k.goal("G-1")!, receipt: null, checks: [], round: 1, workspace: { path: "/w", base_commit: vc.task.base_commit }, deps: vc.deps });
   assert.match(vp, /这是目标验收：目标拆成了 2 个子任务，各自验证过了，这里看合并后的整体/);
   assert.match(vp, new RegExp(`git diff ${r.main1.slice(0, 12)}\\.\\.HEAD`));
+
+  // 目标审核卡的“结果”：分支、没推送、相对目标基底改了哪些文件（接单程序用 git 算的）；系统建的工作区路径不列。
+  pass(k, vc.run_id, "T-3");
+  const review = cardOf(k, (c) => c.kind === "review")!;
+  assert.match(review.body, new RegExp(`\\*\\*结果\\*\\*\\n- 分支 \`xj/T-3-half\`，没推送\\n- 改动（相对基底 ${r.main1.slice(0, 7)}）：新增 half\\.txt、readme\\.txt\\n\\n\\*\\*执行者说明\\*\\*\\n合并好了，已提交`));
+  assert.doesNotMatch(review.body, /xj-split-|工作区：/);
+  assertFeishuLists(review.body);
+});
+
+test("审核卡的结果一段：改动由接单程序用 git 算（已提交的按新增、修改分组），没提交的单独写出来；说明截短、证据一条一行", async () => {
+  const r = repo();
+  const wt = join(r.dir, "wt1");
+  r.git(r.work, "worktree", "add", "-q", "-b", "xj/T-1-x", wt, "main");
+  writeFileSync(join(wt, "math.mjs"), "export const one = 2;\n"); writeFileSync(join(wt, "new.mjs"), "1");
+  r.git(wt, "add", "."); r.git(wt, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "x");
+  writeFileSync(join(wt, "draft.txt"), "没提交");
+  const { workspaceChanges } = await import("../src/worker/worker.ts");
+  assert.deepEqual(await workspaceChanges(wt, r.main1, execReal), { base: r.main1, files: [{ status: "M", path: "math.mjs" }, { status: "A", path: "new.mjs" }], uncommitted: ["draft.txt"] });
+  assert.equal(await workspaceChanges(wt, "不是提交", execReal), null);
+
+  const k = new Kernel(cfg({ claude: CLAUDE }), ":memory:");
+  ev(k, "goal.confirmed", { title: "x" });
+  const c = k.claim("claude", T0, sid())!;
+  ev(k, "workspace.prepared", { task_id: "T-1", path: wt, branch: "xj/T-1-x", base: "main", base_commit: r.main1 }, "worker");
+  receipt(k, c.run_id, "T-1", "done", { handoff: "长".repeat(400), evidence: Array.from({ length: 8 }, (_, i) => ({ check: `检查 ${i}`, result: "ok\n第二行" })),
+    changes: await workspaceChanges(wt, r.main1, execReal) });
+  const body = k.cards()[0]!.body;
+  assert.match(body, /^\*\*结果\*\*\n- 分支 `xj\/T-1-x`，没推送\n- 改动（相对基底 [0-9a-f]{7}）：新增 new\.mjs；修改 math\.mjs\n- 还有没提交的改动：draft\.txt（清理工作区时不会删）/);
+  assert.match(body, /\*\*执行者说明\*\*\n长{300}…\n\n\*\*证据\*\*\n- 检查 0 → ok 第二行\n/);
+  assert.match(body, /- 检查 5 → ok 第二行\n- 另有 2 条，xj why 看$/);
+  assertFeishuLists(body);
 });

@@ -653,12 +653,45 @@ function effectsLine(effects: Effect[]): string {
   return effects.map((x) => `${describeEffect(x)}：${x.status === "done" ? (x.result?.ref ?? "完成") : `${EFFECT_STATUS[x.status]}${x.error ? `（${x.error}）` : ""}`}`).join("；");
 }
 
-function reviewBody(r: Receipt, effects: Effect[] = [], worktrees: Worktree[] = []): string {
-  const ev = (r.evidence ?? []).map((x) => x.check ? `${x.check} → ${x.result ?? ""}` : `${x.artifact ?? ""} ${x.ref ?? ""}`).join("；");
-  const fx = effectsLine(effects.filter((x) => x.kind !== "remove-worktree"));
-  const wt = worktrees.map((w) => `${w.path}${w.branch ? `（${w.branch}）` : ""}`).join("；");
-  // 对外动作放在最前面：截断时先截交接说明，不截人最该看的“推到了哪、PR 在哪”。
-  return [fx && `对外动作：${fx}`, wt && `工作区：${wt}，任务结束后清理`, r.handoff ?? r.summary, ev && `证据：${ev}`].filter(Boolean).join("\n");
+// 审核卡上验证之后的三段：结果、执行者说明、证据（2026-11-13 人看 C-42 觉得不好懂后改）。
+// 结果放最前面，是人最该看的：分支、推没推、相对基底改了哪些文件（接单程序用 git 算的，不靠执行者自己说）、有没有没提交的改动。
+// 系统建的工作区路径不列（审核接受后就清掉，对人没用）；Agent 自己另建的照旧列出（P1-28）。说明截短，证据一条一行。
+const HANDOFF_SHOWN = 300, EVIDENCE_SHOWN = 6, FILES_SHOWN = 12;
+function reviewBody(t: Pick<Task, "workdir">, r: Receipt, effects: Effect[] = [], worktrees: Worktree[] = []): string {
+  const own = worktrees.find((w) => w.path === t.workdir);
+  const extra = worktrees.filter((w) => w.path !== t.workdir);
+  const fx = effects.filter((x) => x.kind !== "remove-worktree");
+  const ch = normalizeChanges(r.changes);
+  const result = [
+    own?.branch ? `- 分支 \`${own.branch}\`${fx.some((x) => x.status === "done") ? "" : "，没推送"}` : "",
+    ...fx.map((x) => `- ${describeEffect(x)}：${x.status === "done" ? (x.result?.ref ?? "完成") : `${EFFECT_STATUS[x.status]}${x.error ? `（${x.error}）` : ""}`}`),
+    ch ? `- 改动（相对基底 ${ch.base.slice(0, 7)}）：${changesLine(ch.files)}` : "",
+    ch?.uncommitted.length ? `- 还有没提交的改动：${ch.uncommitted.slice(0, FILES_SHOWN).join("、")}（清理工作区时不会删）` : "",
+    ...extra.map((w) => `- Agent 另建的工作区 ${w.path}${w.branch ? `（${w.branch}）` : ""}，任务结束后清理`),
+  ].filter(Boolean);
+  const note = (r.handoff ?? r.summary).trim();
+  const ev = (r.evidence ?? []).slice(0, EVIDENCE_SHOWN).map((x) => `- ${x.check ? `${x.check} → ${x.result ?? ""}` : `${x.artifact ?? ""} ${x.ref ?? ""}`.trim()}`.replace(/\s*\n\s*/g, " "));
+  return [
+    result.length ? `**结果**\n${result.join("\n")}` : "",
+    `**执行者说明**\n${note.length > HANDOFF_SHOWN ? `${note.slice(0, HANDOFF_SHOWN)}…` : note}`,
+    ev.length ? `**证据**\n${ev.join("\n")}${(r.evidence?.length ?? 0) > EVIDENCE_SHOWN ? `\n- 另有 ${r.evidence!.length - EVIDENCE_SHOWN} 条，xj why 看` : ""}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+// 改了哪些文件：按新增、修改、删除分组，一组一句。
+function changesLine(files: { status: string; path: string }[]): string {
+  if (!files.length) return "没有提交新的改动";
+  const groups: [string, string][] = [["A", "新增"], ["M", "修改"], ["D", "删除"]];
+  const shown = files.slice(0, FILES_SHOWN);
+  const parts = groups.map(([k, label]) => [label, shown.filter((f) => (k === "M" ? !["A", "D"].includes(f.status) : f.status === k)).map((f) => f.path)] as const)
+    .filter(([, xs]) => xs.length).map(([label, xs]) => `${label} ${xs.join("、")}`);
+  return `${parts.join("；")}${files.length > FILES_SHOWN ? `；另有 ${files.length - FILES_SHOWN} 个` : ""}`;
+}
+function normalizeChanges(x: unknown): { base: string; files: { status: string; path: string }[]; uncommitted: string[] } | null {
+  const c = x as { base?: unknown; files?: unknown; uncommitted?: unknown } | undefined;
+  if (!c || typeof c.base !== "string" || !Array.isArray(c.files)) return null;
+  const files = c.files.filter((f): f is { status: string; path: string } => typeof f?.status === "string" && typeof f?.path === "string");
+  return { base: c.base, files, uncommitted: Array.isArray(c.uncommitted) ? c.uncommitted.filter((u): u is string => typeof u === "string") : [] };
 }
 
 const EFFECT_STATUS: Record<Effect["status"], string> = { queued: "未执行", running: "执行中", done: "完成", failed: "失败", rejected: "没执行", cancelled: "作废" };
@@ -776,7 +809,7 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
   setTaskState(db, taskId, "awaiting_review", e.at);
   // 验证过的（P2-05）：卡上写验证结论，残余风险原样列出；正文放宽，免得截掉人最该看的部分。没验证过的照旧。
   const v = verdictAfter(db, taskId, runId);
-  const body = reviewBody(r, effectsOfTask(db, taskId), worktreesOf(db, taskId));
+  const body = reviewBody(getTask(db, taskId)!, r, effectsOfTask(db, taskId), worktreesOf(db, taskId));
   const t = getTask(db, taskId)!;
   // 合并任务（P2-09、P2-10）：它的验证就是目标验收，出一张目标级审核卡，列出各子任务和它们的残余风险（2026-11-12 人定：只审合并后的结果）。
   if (t.contract.role === "merge") {
@@ -789,7 +822,7 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
   }
   createCard(db, e, "review", taskId, `审核：${r.summary}`, v ? `${verdictBody(v.id, v.verdict)}\n\n${body}` : body,
     [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
-    `review:${taskId}:${runId}`, null, v ? 1500 : undefined);
+    `review:${taskId}:${runId}`, null, v ? 1500 : 1000);   // 结果、说明、证据分段后（2026-11-13）400 字放不下
 }
 
 // 验证通过（或没有验证者）之后：拆出来的子任务直接完成，不出审核卡，等合并后一起审（P2-08，2026-11-12 人定）；其余出审核卡。

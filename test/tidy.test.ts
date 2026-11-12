@@ -63,7 +63,7 @@ test("P1-29 远端不是 GitHub：开 PR 记为没执行，不问人；审核卡
   assert.equal(k.task("T-1")!.state, "awaiting_review");
   const cards = k.cards();
   assert.deepEqual(cards.map((x) => x.kind), ["review"], "没有对外动作卡");
-  assert.match(cards[0]!.body, /^对外动作：开 PR xj\/T-1-explain → main：没执行（远端不是 GitHub，开不了 PR）/);
+  assert.match(cards[0]!.body, /^\*\*结果\*\*\n- 开 PR xj\/T-1-explain → main：没执行（远端不是 GitHub，开不了 PR）/);
 });
 
 // ---- P1-28 ----
@@ -91,7 +91,7 @@ test("P1-28 回执带上 worktree：审核卡列出；任务结束后排清理�
   goal(k, "pow");
   round(k, { outcome: "done", summary: "pow 好了", handoff: "见 math.mjs" }, await taskWorktrees("T-1", dir));
   const review = k.cards()[0]!;
-  assert.match(review.body, new RegExp(`^工作区：${wt("xj-T-1-pow")}（xj/T-1-pow），任务结束后清理\\n见 math\\.mjs`));
+  assert.match(review.body, new RegExp(`^\\*\\*结果\\*\\*\\n- Agent 另建的工作区 ${wt("xj-T-1-pow")}（xj/T-1-pow），任务结束后清理\\n\\n\\*\\*执行者说明\\*\\*\\n见 math\\.mjs`));
   assert.equal(k.claimEffect(T0, sid()), null, "审核前不清理：人可能要进去看");
 
   k.ingest({ source: "cli", source_id: sid(), type: "card.answered", at: T0, payload: { card_id: review.id, choice: "accept" } });

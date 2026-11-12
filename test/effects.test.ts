@@ -57,7 +57,7 @@ test("先落账：回执里的对外动作与回执同事务记下；先推分�
 
   const [card] = k.cards();
   assert.equal(k.task("T-1")!.state, "awaiting_review");
-  assert.match(card!.body, /^对外动作：推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abc1234；开 PR xj\/T-1-pow → main：https:\/\/github\.com\/me\/repo\/pull\/7\n见 math\.mjs/);
+  assert.match(card!.body, /^\*\*结果\*\*\n- 推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abc1234\n- 开 PR xj\/T-1-pow → main：https:\/\/github\.com\/me\/repo\/pull\/7\n\n\*\*执行者说明\*\*\n见 math\.mjs/);
   assert.deepEqual(k.why("X-1").map((e) => e.type), ["run.receipt", "effect.claimed", "effect.result"]);
 });
 
@@ -67,7 +67,7 @@ test("不合规矩的请求不执行，记为 rejected，审核卡上照实列�
   assert.deepEqual(effects(k).map((x) => x.status), ["rejected", "rejected", "rejected"]);
   assert.equal(k.claimEffect(T0, sid()), null);
   assert.equal(k.task("T-1")!.state, "awaiting_review", "没有要等的，直接出审核卡");
-  assert.match(k.cards()[0]!.body, /推分支 origin\/feature\/pow：没执行（分支名要带任务编号 T-1（出身标记））；send-email：没执行（一期只支持 push-branch、open-pr）；推分支 origin\/main：没执行/);
+  assert.match(k.cards()[0]!.body, /- 推分支 origin\/feature\/pow：没执行（分支名要带任务编号 T-1（出身标记））\n- send-email：没执行（一期只支持 push-branch、open-pr）\n- 推分支 origin\/main：没执行/);
 });
 
 test("不在授权内的种类不执行", () => {
@@ -109,7 +109,7 @@ test("不可重试的失败（远端拒绝）立即问人；选跳过直接出�
   const card = k.cards()[0]!;
   k.ingest({ source: "cli", source_id: sid(), type: "card.answered", at: T0, payload: { card_id: card.id, choice: "skip" } });
   assert.equal(k.task("T-1")!.state, "awaiting_review");
-  assert.match(k.cards()[0]!.body, /推分支 origin\/xj\/T-1-pow：失败（推送失败：! \[rejected\] \(non-fast-forward\)）；开 PR xj\/T-1-pow → main：作废/);
+  assert.match(k.cards()[0]!.body, /- 推分支 origin\/xj\/T-1-pow：失败（推送失败：! \[rejected\] \(non-fast-forward\)）\n- 开 PR xj\/T-1-pow → main：作废/);
 });
 
 test("执行超时或接单程序重启：按可重试的失败重排（重做前查远端，不会做两遍）", () => {
@@ -136,7 +136,7 @@ test("叫停：还没执行的对外动作作废；回执是 waiting（写了 la
   assert.match(k.task("T-1")!.feedback ?? "", /系统已执行你请求的对外动作：推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abc1234/);
   const c = k.claim("claude", T0, sid())!;
   k.ingest({ source: "worker", source_id: sid(), type: "run.receipt", at: T0, payload: { run_id: c.run_id, task_id: "T-1", receipt: { outcome: "done", summary: "推好了", handoff: "远端已是 abc1234" } } });
-  assert.match(k.cards()[0]!.body, /^对外动作：推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abc1234\n/, "前一轮请求的动作也上审核卡");
+  assert.match(k.cards()[0]!.body, /^\*\*结果\*\*\n- 推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abc1234\n/, "前一轮请求的动作也上审核卡");
   assert.equal((k.db.prepare("SELECT COUNT(*) n FROM timers WHERE about = 'T-1' AND fired = 0").get() as { n: number }).n, 0, "兜底定时器撤掉");
   const k2 = kernel();
   done(k2, [PUSH, PR]);
@@ -152,7 +152,7 @@ test("waiting 但没写 later、只在等自己请求的对外动作：按 done 
   assert.equal(k.task("T-1")!.state, "verifying");
   k.claimEffect(T0, sid()); result(k, "X-1", true, { ref: "origin/xj/T-1-pow@abc1234" });
   assert.equal(k.task("T-1")!.state, "awaiting_review");
-  assert.match(k.cards()[0]!.body, /^对外动作：推分支/);
+  assert.match(k.cards()[0]!.body, /^\*\*结果\*\*\n- 推分支/);
 });
 
 test("waiting 的任务，对外动作失败：撤掉等待，任务受阻，出对外动作卡", () => {
@@ -262,7 +262,7 @@ test("接单程序：经本机接口领对外动作、执行、报结果，审�
     assert.equal(await w.effectOnce(), false);
     assert.deepEqual(ran.at(-1), ["git", "push", "origin", "refs/heads/xj/T-1-pow:refs/heads/xj/T-1-pow"]);
     assert.equal(k.task("T-1")!.state, "awaiting_review");
-    assert.match(k.cards()[0]!.body, /^对外动作：推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abcdef1/);
+    assert.match(k.cards()[0]!.body, /^\*\*结果\*\*\n- 推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abcdef1/);
   } finally { server.close(); k.close(); }
 });
 
