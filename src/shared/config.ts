@@ -22,10 +22,16 @@ export interface Config {
   owner_open_id: string;      // 只认你本人（飞书 open_id）
   backup_dir: string;         // 快照目录（首版在系统盘）
   brief_at: string;           // 每日简报的本机时间 HH:MM（人定 2026-11-12：09:00）
+  worktree_root: string;      // 每任务一个 worktree 的根目录（P2-02），默认 ~/xj-worktrees，下面按仓库名分
+  // 调度上限（2026-11-12 人定，暂定）。只影响调度，不影响账本重放。
   limits: {
-    backpressure_cards: number;      // 待处理决策卡+审核卡上限，默认 5
-    weekly_quota_ratio: number;      // 自动化不超过订阅周限额的比例，默认 0.8（人定 2026-11-12，原为 0.6）
-    per_goal_concurrency: number;
+    backpressure_cards: number;      // 背压软上限：待处理决策卡+审核卡到这个数，不开新任务的第一轮。默认 5
+    backpressure_hard: number;       // 背压硬上限：到这个数，只放行带人回答的任务和验证轮。默认 8
+    weekly_quota_ratio: number;      // 周用量到这个比例只跑人亲自提的目标，默认 0.8（人定 2026-11-12，原为 0.6）
+    downgrade_quota_ratio: number;   // 周用量到这个比例执行降为 1 个、禁用子 Agent，默认 0.6
+    per_goal_concurrency: number;    // 每个目标同时几个执行，默认 1
+    verify_concurrency: number;      // 验证同时几个，默认 1（二期第二批接 Codex 验证者时用）
+    max_tasks_per_goal: number;      // 一个目标最多拆几个任务，默认 4（二期第三批规划时用）
     hop_limit: number;               // 跳数熔断，默认 8
   };
   agents: Record<string, AgentProfile>;
@@ -37,7 +43,9 @@ export const DEFAULTS: Config = {
   owner_open_id: "",
   backup_dir: "./data/backups",
   brief_at: "09:00",
-  limits: { backpressure_cards: 5, weekly_quota_ratio: 0.8, per_goal_concurrency: 2, hop_limit: 8 },
+  worktree_root: "~/xj-worktrees",
+  limits: { backpressure_cards: 5, backpressure_hard: 8, weekly_quota_ratio: 0.8, downgrade_quota_ratio: 0.6,
+    per_goal_concurrency: 1, verify_concurrency: 1, max_tasks_per_goal: 4, hop_limit: 8 },
   agents: {
     claude: { use: "claude", kinds: ["code", "plan", "write", "judge"], tier: "strong", billing: "subscription", capacity: 2 },
   },

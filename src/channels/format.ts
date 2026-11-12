@@ -1,5 +1,6 @@
 // 入口共用的文字格式：xj 和飞书通道用同一套写法说状态和卡片。
 import type { Card, Event } from "../kernel/types.ts";
+import { backpressureLine, type BackpressureView } from "../kernel/attention.ts";
 
 export const WAITING = { human: "等人", agent: "等 Agent", world: "等世界", none: "不再等" } as const;
 export const CARD_KIND = { decision: "决策", review: "审核", notice: "知会" } as const;
@@ -9,6 +10,8 @@ export type Overview = {
   tasks: { id: string; goal_id: string; state: string; runs_used: number; waiting_on: keyof typeof WAITING; session_id: string | null }[];
   cards: Card[];
   quota: { agent: string; seven_day_utilization: number | null; five_hour_utilization: number | null }[];
+  backpressure?: BackpressureView | undefined;
+  slots?: { agent: string; capacity: number; running: number; subagents: boolean; human_only: boolean; utilization: number | null }[] | undefined;
   backup?: { snapshot_ok_at: string | null; snapshot_failed_at: string | null; drill_ok_at: string | null; drill_failed_at: string | null } | undefined;
 };
 
@@ -44,6 +47,8 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
   const out: string[] = [];
   const { need, fyi } = splitCards(o.cards);
   out.push(`需要你：${need.length ? `${need.length} 张卡片（${opts.cardsHint}）` : "没有"}${fyi.length ? `；另有 ${fyi.length} 张知会卡` : ""}`);
+  const bp = o.backpressure && backpressureLine(o.backpressure);
+  if (bp) out.push(bp);
   const finished = (s: string) => s === "done" || s === "abandoned" || s === "stopped";
   const active = o.goals.filter((g) => !finished(g.status));
   const done = o.goals.filter((g) => finished(g.status));
@@ -53,6 +58,10 @@ export function showStatus(o: Overview, opts: { cardsHint: string; doneLimit?: n
     for (const t of o.tasks.filter((x) => x.goal_id === g.id)) out.push(`  ${t.id} [${t.state}] ${WAITING[t.waiting_on]} · 已跑 ${t.runs_used} 轮`);
   }
   if (shownDone.length < done.length) out.push(`（另有 ${done.length - shownDone.length} 个已结束的目标未列出）`);
+  for (const s of o.slots ?? []) {
+    const why = s.human_only ? "，周用量过上限，只跑你亲自提的目标" : !s.subagents ? "，周用量过降档线，降档且不起子 Agent" : "";
+    out.push(`执行 ${s.agent}：${s.running}/${s.capacity} 在跑${why}`);
+  }
   for (const q of o.quota) {
     const pct = (x: number | null) => (x == null ? "?" : `${Math.round(x * 100)}%`);
     out.push(`额度 ${q.agent}：周 ${pct(q.seven_day_utilization)}，5 小时 ${pct(q.five_hour_utilization)}`);

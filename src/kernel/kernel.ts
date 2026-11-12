@@ -4,8 +4,8 @@ import { openStore, transaction, clearProjections, type DB } from "./store.ts";
 import { appendEvent, readEvents, eventsAbout } from "./events.ts";
 import { reduce, getGoal, getTask, getJudgment, getEffect, backupStatus } from "./reducer.ts";
 import { reconcileGoals } from "./reconcile.ts";
-import { pickNext } from "./scheduler.ts";
-import { openCards, rowToCard } from "./attention.ts";
+import { pickNext, throttle } from "./scheduler.ts";
+import { openCards, rowToCard, backpressureView } from "./attention.ts";
 import { waitingOn } from "./state.ts";
 import type { Config } from "../shared/config.ts";
 import type { Card, Effect, Event, EventInput, Judgment, Receipt, Run, Task, TaskState } from "./types.ts";
@@ -18,6 +18,7 @@ export interface Claim {
   task: Task;
   agent: string;
   purpose: "execute";
+  subagents: boolean;          // 这一轮能不能起子 Agent（周用量过降档线时 false，P2-01）
   run_id: string;
   feedback: string | null;
   recovery: string | null;     // 上一轮中断后的恢复说明（P1-14）
@@ -34,7 +35,7 @@ export class Kernel {
 
   // 返回落账的事件；重复事件返回 null。
   ingest(input: EventInput): Event | null {
-    return transaction(this.db, () => this.apply(input));
+    return transaction(this.db, () => this.apply(stamp(input, this.cfg)));
   }
 
   private apply(input: EventInput): Event | null {
@@ -69,7 +70,7 @@ export class Kernel {
       if (!e) return null; // 同一个来源编号重复领活：不再派第二次
       const run = this.db.prepare(`SELECT id FROM runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC, rowid DESC LIMIT 1`)
         .get(before.id) as { id: string };
-      return { task: getTask(this.db, before.id)!, agent, purpose: a.purpose, run_id: run.id,
+      return { task: getTask(this.db, before.id)!, agent, purpose: a.purpose, subagents: a.subagents, run_id: run.id,
         feedback: before.feedback, recovery: before.recovery, previous: this.lastReceipt(before.id) };
     });
   }
@@ -141,8 +142,17 @@ export class Kernel {
     const goals = this.db.prepare(`SELECT id, title, status FROM goals ORDER BY created_at, rowid`).all();
     const runs = this.db.prepare(`SELECT id, task_id, agent, status, session_id, started_at, finished_at FROM runs ORDER BY rowid`).all();
     const quota = this.db.prepare(`SELECT * FROM quota`).all();
-    return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups() };
+    // 调度现状（P2-01、P2-06）：背压在哪一档、挡着几件活；各档案的名额和是否降档。按配置现算，不入库。
+    const backpressure = backpressureView(this.db, { soft: this.cfg.limits.backpressure_cards, hard: this.cfg.limits.backpressure_hard });
+    const slots = Object.keys(this.cfg.agents).map((agent) => ({ agent, ...throttle(this.db, this.cfg, agent)! }));
+    return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups(), backpressure, slots };
   }
 
   close() { this.db.close(); }
+}
+
+// 落账前补上要随事件记下的配置：简报要写背压，背压上限在配置里，记进事件，重放时不随配置变（P2-06）。
+function stamp(input: EventInput, cfg: Config): EventInput {
+  if (input.type !== "brief.due" || input.payload.backpressure) return input;
+  return { ...input, payload: { ...input.payload, backpressure: { soft: cfg.limits.backpressure_cards, hard: cfg.limits.backpressure_hard } } };
 }

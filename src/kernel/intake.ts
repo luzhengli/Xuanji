@@ -53,17 +53,26 @@ export function normalizeDraft(obj: unknown): DraftResult {
     const runs = b.runs as number, minutes = b.minutes as number;
     if (runs >= 1 && runs <= 50 && minutes >= 5 && minutes <= 1440) draft.budget = { runs, minutes };
   }
+  const base = normalizeBase(r.base);
+  if (base) draft.base = base;
   return { ok: true, draft };
+}
+
+// 基底（P2-02）：分支名或提交号。只认 git 引用里常见的字符，不认 .. 和开头的 -（免得被当成命令行参数）。
+export function normalizeBase(x: unknown): string | undefined {
+  const b = typeof x === "string" ? x.trim() : "";
+  return b && b.length <= 100 && /^[A-Za-z0-9._\/-]+$/.test(b) && !b.includes("..") && !b.startsWith("-") ? b : undefined;
 }
 
 // 目标卡的正文：提醒（有才列）、验收、边界、授权。目标本身在卡片标题里。
 // 各段之间空一行：飞书的 markdown 不空行时，下一段的标题会接到上一段列表最后一项的末尾（2026-11-12 真实一轮看到）。
-export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant">, notes: string[] = []): string {
+export function goalCardBody(g: Pick<Goal, "acceptance" | "boundaries" | "grant"> & { base?: string | null | undefined }, notes: string[] = []): string {
   const bullets = (xs: string[], none: string) => (xs.length ? xs.map((x) => `- ${x}`).join("\n") : `- ${none}`);
   return [
     ...(notes.length ? [`**提醒**\n${bullets(notes, "")}`] : []),
     `**验收**\n${bullets(g.acceptance, "（未整理，按目标本身验收）")}`,
     `**边界**\n${bullets(g.boundaries, "（无）")}`,
+    ...(g.base ? [`**基底** 从 ${g.base} 拉分支（不是主干；要改在修改意见里写）`] : []),
     `**授权** ${grantLine(g.grant)}`,
   ].join("\n\n");
 }

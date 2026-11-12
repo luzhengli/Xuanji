@@ -1,5 +1,5 @@
 // 接单程序入口。由 launchd 拉起；重启后先清理上个实例的 Agent 进程，再报到，内核把旧实例的轮次带恢复说明重新派发。
-// 环境变量：XJ_WORK_ROOT 任务的工作目录（一期所有任务共用，二期改每任务一个 worktree）；
+// 环境变量：XJ_WORK_ROOT 工作仓库；每个任务在它的 worktree 里做（P2-02，位置见配置 worktree_root）；
 //           XJ_RECORD_DIR 设了就把每轮原始输出存下来，用作测试的录制输出；
 //           XJ_WORKER_NAME 接单程序名（默认 local），同名的新实例启动即接管旧实例的轮次。
 import { dirname, join, resolve } from "node:path";
@@ -14,10 +14,10 @@ const pidDir = join(dirname(resolve(cfg.db)), "worker-pids", identity.worker);
 const client = kernelClient(`http://127.0.0.1:${cfg.port}`, "worker", { worker: identity });
 const workRoot = process.env.XJ_WORK_ROOT ?? process.cwd();
 const worker = new Worker(client, { claude: new ClaudeCodeAdapter({ recordDir: process.env.XJ_RECORD_DIR, pidDir }) }, workRoot,
-  { profiles: cfg.agents, identity, reap: () => reapOrphans(pidDir) });
+  { profiles: cfg.agents, identity, reap: () => reapOrphans(pidDir), worktreeRoot: cfg.worktree_root });
 const POLL_MS = 5_000;
 const JUDGE_POLL_MS = 2_000;   // 主理人是人刚说的话，领得勤一些
-console.log(`[worker] ${identity.worker}（${identity.instance}）工作目录 ${workRoot}，档案 ${Object.entries(cfg.agents).map(([k, v]) => `${k}${v.model ? `(${v.model})` : ""}`).join(", ")}`);
+console.log(`[worker] ${identity.worker}（${identity.instance}）工作仓库 ${workRoot}，worktree 在 ${cfg.worktree_root}，档案 ${Object.entries(cfg.agents).map(([k, v]) => `${k}${v.model ? `(${v.model})` : ""}`).join(", ")}`);
 
 // 执行和判断点各一个循环，互不等待：执行一轮可能跑两小时，人这时说一句话，主理人照样马上整理。
 async function poll(name: string, once: (agent: string) => Promise<boolean>, idleMs: number): Promise<never> {
@@ -27,6 +27,22 @@ async function poll(name: string, once: (agent: string) => Promise<boolean>, idl
       try { did = (await once(agent)) || did; } catch (e) { console.error(`[worker] ${name}`, (e as Error).message); }
     }
     if (!did) await new Promise((r) => setTimeout(r, idleMs));
+  }
+}
+
+// 执行（P2-01 起并行）：领到一件就让它在后台跑，接着领，领不到为止。同时跑几个由内核按名额决定，
+// 一轮跑完马上再领一次，不等下一个轮询间隔。
+async function executions(): Promise<never> {
+  let wake: () => void = () => {};
+  for (;;) {
+    let did = false;
+    for (const agent of Object.keys(cfg.agents)) {
+      try {
+        const run = await worker.begin(agent);
+        if (run) { did = true; run.done.finally(() => wake()); }
+      } catch (e) { console.error("[worker] 执行", (e as Error).message); }
+    }
+    if (!did) await new Promise<void>((r) => { wake = r; setTimeout(r, POLL_MS); });
   }
 }
 
@@ -42,6 +58,6 @@ async function main() {
       if (!did) await new Promise((r) => setTimeout(r, JUDGE_POLL_MS));
     }
   };
-  await Promise.all([poll("执行", (a) => worker.once(a), POLL_MS), poll("判断点", (a) => worker.judgeOnce(a), JUDGE_POLL_MS), effects()]);
+  await Promise.all([executions(), poll("判断点", (a) => worker.judgeOnce(a), JUDGE_POLL_MS), effects()]);
 }
 main();

@@ -100,6 +100,7 @@ const ADDED_COLUMNS: [table: string, column: string, decl: string][] = [
   ["runs", "feedback", "TEXT"],                           // 这一轮领活时带走的反馈；回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）
   ["tasks", "worktrees", "TEXT"],                         // Agent 建的 git worktree（JSON 数组，P1-28），任务结束后清理
   ["cards", "shown", "TEXT"],                             // 飞书上最后一次显示的状态（P1-27）
+  ["goals", "base", "TEXT"],                              // 人写明的基底（P2-02）
 ];
 
 export function openStore(path: string): DB {

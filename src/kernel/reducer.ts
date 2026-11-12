@@ -6,7 +6,9 @@ import { formatId } from "../shared/ids.ts";
 import { dueAt } from "../shared/duration.ts";
 import { assertTransition, waitingOn } from "./state.ts";
 import { BUDGET_EXTEND, overBudget, runLimitMinutes } from "./budget.ts";
-import { TITLE_MAX, goalCardBody, normalizeDraft, minutesText } from "./intake.ts";
+import { TITLE_MAX, goalCardBody, normalizeDraft, normalizeBase, minutesText } from "./intake.ts";
+import { backpressureView, backpressureLine, SYSTEM_FEEDBACK_PREFIX } from "./attention.ts";
+import { leasePatterns } from "./scheduler.ts";
 import type { Event, Goal, GoalStatus, Grant, Task, TaskContract, TaskState, Receipt, CardKind, CardForm, CardOption, RulingScope,
   Draft, IntakeInput, Judgment, JudgmentKind, PendingGoal, Effect, ReceiptEffect, Worktree } from "./types.ts";
 
@@ -49,9 +51,11 @@ export const BUDGET_OPTIONS: CardOption[] = [
 export const handlers: Record<string, Handler> = {
   // 人直接立项（xj goal --direct；P1-10 之前的飞书私聊也走这里）。不经主理人。
   "goal.confirmed": (db, e) => {
-    const p = e.payload as { title: string; acceptance?: string[]; boundaries?: string[]; grant?: Partial<Grant> };
+    const p = e.payload as { title: string; acceptance?: string[]; boundaries?: string[]; grant?: Partial<Grant>; base?: string };
     const grant = { ...DEFAULT_GRANT, ...(p.grant ?? {}) };
     const id = insertGoal(db, e, p.title, p.acceptance ?? [], p.boundaries ?? [], grant, "active");
+    const base = normalizeBase(p.base);
+    if (base) db.prepare(`UPDATE goals SET base = ? WHERE id = ?`).run(base, id);
     createTask(db, e, id);
   },
 
@@ -117,7 +121,25 @@ export const handlers: Record<string, Handler> = {
     // 记下这一轮带走的反馈：回执到了只清掉这部分，跑的过程中新到的补充留给下一轮（P1-23）。
     db.prepare(`UPDATE runs SET feedback = (SELECT feedback FROM tasks WHERE id = ?) WHERE id = ?`).run(p.task_id, rid);
     db.prepare(`UPDATE tasks SET runs_used = runs_used + 1 WHERE id = ?`).run(p.task_id);
+    // 租约（P2-03）：这一轮的可写范围和独占资源登记进账本，轮次结束即释放（见 reduce 末尾）。
+    const t = getTask(db, p.task_id);
+    if (t) for (const pat of leasePatterns(t.contract)) db.prepare(`INSERT OR IGNORE INTO leases VALUES (?, ?)`).run(t.id, pat);
     link(db, e.seq, rid);
+  },
+
+  // 接单程序在第一轮之前给任务建好了 worktree（P2-02）：路径、分支、基底提交落账，以后每轮都在这里做。
+  // 任务结束后照 P1-28 的办法清理（没提交的改动不删，分支留着）。
+  "workspace.prepared": (db, e) => {
+    const p = e.payload as { task_id: string; path?: unknown; branch?: unknown; base?: unknown; base_commit?: unknown; repo?: unknown };
+    const t = getTask(db, p.task_id);
+    const str = (x: unknown) => (typeof x === "string" ? x : "");
+    const path = str(p.path), branch = str(p.branch), repo = str(p.repo);
+    if (!t || !path.startsWith("/")) return;
+    db.prepare(`UPDATE tasks SET workdir = ? WHERE id = ?`).run(path, t.id);
+    const have = worktreesOf(db, t.id).filter((w) => w.path !== path);
+    db.prepare(`UPDATE tasks SET worktrees = ? WHERE id = ?`)
+      .run(JSON.stringify([...have, { path, ...(branch ? { branch } : {}), ...(repo.startsWith("/") ? { repo } : {}) }]), t.id);
+    link(db, e.seq, t.id, `工作区 ${path}，分支 ${branch || "?"}，基底 ${str(p.base) || "?"}@${str(p.base_commit).slice(0, 7) || "?"}`);
   },
 
   // 心跳顺带报会话编号：轮次中途断掉时，恢复的那一轮还能接上原会话。
@@ -430,6 +452,8 @@ export function recoveryNote(runId: string, reason: string): string {
 export function reduce(db: DB, e: Event): void {
   handlers[e.type]?.(db, e);
   queueCleanups(db, e);
+  // 轮次结束（回执、中断、限流、叫停）租约即释放。放在这里而不是各个结束轮次的地方，漏不掉。
+  db.prepare(`DELETE FROM leases WHERE task_id NOT IN (SELECT task_id FROM runs WHERE status = 'running')`).run();
   // 引用图最小版（P1-18）：事件涉及的编号一律回写关联表。处理器签发的新编号在处理器里已经写过。
   const p = e.payload as Record<string, unknown>;
   for (const ref of [e.about, p.task_id, p.run_id, p.about]) if (typeof ref === "string") link(db, e.seq, ref);
@@ -475,7 +499,7 @@ export function getGoal(db: DB, id: string): Goal | undefined {
   const r = db.prepare(`SELECT * FROM goals WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
   if (!r) return undefined;
   return { id: r.id as string, title: r.title as string, acceptance: JSON.parse(r.acceptance as string), boundaries: JSON.parse(r.boundaries as string),
-    grant: JSON.parse(r.grant_json as string), status: r.status as Goal["status"], origin_event: r.origin_event as number,
+    grant: JSON.parse(r.grant_json as string), base: (r.base as string | null) ?? null, status: r.status as Goal["status"], origin_event: r.origin_event as number,
     created_at: r.created_at as string, updated_at: r.updated_at as string };
 }
 
@@ -558,6 +582,7 @@ function createTask(db: DB, e: Event, goalId: string): string {
     scope: { write: ["**"], effects: g.grant.effects },
     budget: g.grant.budget, ask_first: g.grant.ask_first, depends_on: [],
     agent: { kind: "code", tier: "strong" },
+    ...(g.base ? { base: g.base } : {}),
   };
   db.prepare(`INSERT INTO tasks(id, goal_id, state, contract, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?)`)
     .run(tid, goalId, JSON.stringify(contract), e.at, e.at);
@@ -611,6 +636,7 @@ function answerBudgetCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void
     const b = task.contract.budget;
     const budget = { ...b, runs: Math.max(b.runs, task.runs_used) + BUDGET_EXTEND.runs, minutes: Math.max(b.minutes, Math.ceil(task.minutes_used)) + BUDGET_EXTEND.minutes };
     db.prepare(`UPDATE tasks SET contract = ?, failures = 0 WHERE id = ?`).run(JSON.stringify({ ...task.contract, budget }), task.id);
+    // 只追加预算、没写话的，不算“带人回答”（背压下按在做的处理，P2-06）：没有要带给下一轮的内容。
     if (p.text) setFeedback(db, task.id, `人追加预算时说（${card.id}）：${p.text}`);
     requeue(db, e, task.id, `人追加预算到 ${budget.runs} 轮、${budget.minutes} 分钟，回队列`);
   } else {
@@ -677,7 +703,7 @@ function queueCleanups(db: DB, e: Event): void {
       const run = db.prepare(`SELECT id FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1`).get(t.id) as { id: string } | undefined;
       const id = formatId("X", nextId(db, "effect"));
       db.prepare(`INSERT INTO effects(id, task_id, run_id, kind, params, key, status, created_at) VALUES (?, ?, ?, 'remove-worktree', ?, ?, 'queued', ?)`)
-        .run(id, t.id, run?.id ?? "", JSON.stringify({ branch: w.branch ?? "", remote: "", path: w.path }), key, e.at);
+        .run(id, t.id, run?.id ?? "", JSON.stringify({ branch: w.branch ?? "", remote: "", path: w.path, ...(w.repo ? { repo: w.repo } : {}) }), key, e.at);
       link(db, e.seq, id, `任务结束，清理工作区 ${w.path}`);
       link(db, e.seq, t.id, `${id} 清理工作区 ${w.path}`);
     }
@@ -752,7 +778,7 @@ function settleEffects(db: DB, e: Event, taskId: string): void {
   const fx = effectsOfRun(db, run.id);
   if (!fx.length) return;
   clearWaits(db, taskId);
-  setFeedback(db, taskId, `系统已执行你请求的对外动作：${effectsLine(fx)}。据此接着做；做完了就交 done。`);
+  setFeedback(db, taskId, `${SYSTEM_FEEDBACK_PREFIX}你请求的对外动作：${effectsLine(fx)}。据此接着做；做完了就交 done。`);
   requeue(db, e, taskId, "请求的对外动作做完了，带着结果回队列");
 }
 
@@ -824,7 +850,8 @@ function amendGoal(db: DB, e: Event, j: Judgment, self: Goal, target: string): v
 }
 
 function draftOf(g: Goal): Draft {
-  return { kind: "goal", direct: false, title: g.title, acceptance: g.acceptance, boundaries: g.boundaries, ask_first: g.grant.ask_first, budget: g.grant.budget };
+  return { kind: "goal", direct: false, title: g.title, acceptance: g.acceptance, boundaries: g.boundaries, ask_first: g.grant.ask_first, budget: g.grant.budget,
+    ...(g.base ? { base: g.base } : {}) };
 }
 
 // ---- 主理人（P1-10）----
@@ -879,6 +906,7 @@ function onIntake(db: DB, e: Event, j: Judgment, draft: Draft): void {
   const grant: Grant = { ...goal.grant, ask_first: draft.ask_first, budget: draft.budget ?? DEFAULT_GRANT.budget };
   db.prepare(`UPDATE goals SET title = ?, acceptance = ?, boundaries = ?, grant_json = ?, updated_at = ? WHERE id = ?`)
     .run(draft.title, JSON.stringify(draft.acceptance), JSON.stringify(draft.boundaries), JSON.stringify(grant), e.at, goal.id);
+  db.prepare(`UPDATE goals SET base = ? WHERE id = ?`).run(draft.base ?? null, goal.id);
   // 小而明确的请求跳过确认、直接立项（设计文档“说目标”）。只认初稿，不能改默认预算，也不能带提醒；
   // 改过一次的、主理人觉得有事要人知道的，一律请人确认。
   if (draft.direct && j.input.revision === 0 && !draft.budget && !draft.notes?.length) {
@@ -914,7 +942,7 @@ function answerGoalCard(db: DB, e: Event, card: AnsweredCard, p: Answer): void {
     const input = prev ? getJudgment(db, prev.id)!.input : { request: goal.title, revision: 0 };
     queueJudgment(db, e, "intake", goal.id, {
       request: input.request, revision: input.revision + 1,
-      draft: { kind: "goal", direct: false, title: goal.title, acceptance: goal.acceptance, boundaries: goal.boundaries, ask_first: goal.grant.ask_first, budget: goal.grant.budget },
+      draft: draftOf(goal),
       feedback: p.text?.trim() || "人要求修改，但没写改什么",
     });
   }
@@ -969,7 +997,8 @@ function withdrawAlert(db: DB, e: Event, key: string, why: string): void {
 // 简报本身是一张知会卡，内核从账本现算：要你处理的卡片、上次简报以来完成的任务、在做的事、知会、额度。
 // 汇总过的知会卡（含上一份简报）收起，不再出现在 /card 和 /status 里。
 function brief(db: DB, e: Event): void {
-  const p = e.payload as { date?: unknown };
+  // 背压上限在配置里，内核落账时写进了这条事件（Kernel.ingest），所以重放结果不随配置变。
+  const p = e.payload as { date?: unknown; backpressure?: { soft?: unknown; hard?: unknown } };
   const date = typeof p.date === "string" ? p.date : e.at.slice(0, 10);
   const last = db.prepare(`SELECT created_at FROM cards WHERE form = 'brief' ORDER BY rowid DESC LIMIT 1`).get() as { created_at: string } | undefined;
   const open = db.prepare(`SELECT id, kind, title, form FROM cards WHERE status = 'open' ORDER BY created_at, rowid`).all() as { id: string; kind: CardKind; title: string; form: CardForm | null }[];
@@ -988,6 +1017,11 @@ function brief(db: DB, e: Event): void {
     lines.push(`**需要你**：${[count("decision") && `决策 ${count("decision")} 张`, count("review") && `审核 ${count("review")} 张`].filter(Boolean).join("、")}（发 /card 取）`,
       ...list(need.map((c) => `${c.id} ${c.title}`)));
   } else lines.push("**需要你**：没有");
+  const bl = p.backpressure;
+  if (bl && typeof bl.soft === "number" && typeof bl.hard === "number") {
+    const line = backpressureLine(backpressureView(db, { soft: bl.soft, hard: bl.hard }));
+    if (line) lines.push(`**${line.split("，")[0]}**：${line.slice(line.indexOf("，") + 1)}`);
+  }
   if (done.length) lines.push(`**完成** ${done.length} 件`, ...list(done.map((t) => `${t.id} ${(JSON.parse(t.contract) as TaskContract).objective}`)));
   const busy = (["agent", "world", "human"] as const).map((w) => [w, states.filter((s) => s === w).length] as const).filter(([, n]) => n);
   lines.push(`**在做**：${busy.length ? busy.map(([w, n]) => `${{ agent: "等 Agent", world: "等世界", human: "等人" }[w]} ${n}`).join(" · ") : "没有"}`);

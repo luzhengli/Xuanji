@@ -36,6 +36,7 @@ export interface Goal {
   acceptance: string[];
   boundaries: string[];
   grant: Grant;
+  base?: string | null;          // 人写明的基底（分支或提交，P2-02）；没写从主干拉
   status: GoalStatus;
   origin_event: number;
   created_at: string;
@@ -53,12 +54,14 @@ export type TaskState =
 export interface TaskContract {
   objective: string;
   acceptance: { checks: string[]; criteria: string[] };
-  scope: { write: string[]; effects: string[] };
+  // write：可写范围，登记成租约（P2-03）；exclusive：具名独占资源（预发环境、数据库迁移、发布通道）。
+  scope: { write: string[]; effects: string[]; exclusive?: string[] };
   budget: { runs: number; minutes: number; usd?: number };
   ask_first: string[];
   depends_on: string[];
   agent: { kind: AgentKind; tier: "strong" | "light" };
   skill?: string;
+  base?: string;                 // worktree 从哪拉（P2-02）：目标写明的分支或提交；没有就从主干拉
 }
 
 export interface Task {
@@ -105,7 +108,8 @@ export interface ReceiptAsk { question: string; why?: string; options?: string[]
 export interface ReceiptLater { on?: string; timeout?: string; about: string; }
 export interface ReceiptFound { title: string; why?: string; }
 // Agent 在任务里建的 git worktree（P1-28）：接单程序每轮结束后查 git worktree list，路径或分支名带任务编号的随回执上报。
-export interface Worktree { path: string; branch?: string | undefined; }
+// repo：所属仓库的主工作区，清理时在那里执行（系统建的每任务 worktree 才有，P2-02）。
+export interface Worktree { path: string; branch?: string | undefined; repo?: string | undefined; }
 // 要系统代为执行的对外动作（P1-21）。Agent 自己不做，写进回执；内核先落账，接单程序再执行。
 export interface ReceiptEffect { kind: string; branch?: string; base?: string; remote?: string; title?: string; body?: string; }
 
@@ -161,7 +165,7 @@ export interface Effect {
   task_id: string;
   run_id: string;
   kind: string;
-  params: { branch: string; remote: string; base?: string; title?: string; body?: string; path?: string };
+  params: { branch: string; remote: string; base?: string; title?: string; body?: string; path?: string; repo?: string };
   key: string;                   // 幂等键：同一轮回执里重复的请求只记一次
   status: EffectStatus;
   attempts: number;
@@ -221,6 +225,7 @@ export interface Draft {
   ask_first: string[];
   notes?: string[] | undefined;  // 提醒：人确认前该知道的情况（例如要加的函数已经有了），只上卡片，不进契约
   budget?: { runs: number; minutes: number } | undefined;   // 只有人明确提到才有
+  base?: string | undefined;     // 只有人写明基于哪个分支或提交才有（P2-02）
   reply?: string | undefined;    // 不是目标时回人的一句话
 }
 

@@ -76,7 +76,9 @@ export async function runEffect(x: Effect, cwd: string, goalId: string, exec: Ex
   }
   if (x.kind === "remove-worktree") {
     // 只删这个仓库登记过的 worktree，有没提交的改动就不删（不 --force），分支留着，提交不会丢。
+    // 系统建的每任务 worktree（P2-02）记着主仓库，在主仓库里执行：任务的工作目录就是要删的那个。
     const path = x.params.path ?? "";
+    if (x.params.repo) cwd = x.params.repo;
     const list = await exec("git", ["worktree", "list", "--porcelain"], cwd);
     if (list.code) return fail("查 worktree 失败", list);
     if (!parseWorktrees(list.stdout).some((w) => w.path === path)) return { ok: true, detail: `${path} 已经不在了` };

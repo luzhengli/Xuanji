@@ -6,6 +6,8 @@ import { buildPrompt, buildResumePrompt, buildIntakePrompt } from "./context-pac
 import type { AgentAdapter, RunRequest, RunResult } from "./adapters/types.ts";
 import type { Effect, Goal, Judgment, Receipt, Task } from "../kernel/types.ts";
 import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
+import { prepareWorkspace, staleProcesses, type Workspace } from "./workspace.ts";
+import { existsSync } from "node:fs";
 
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
@@ -24,6 +26,9 @@ export const EXECUTION_PERMISSION_MODE = "auto";
 // - claude、codex：再起一个 Agent 会绕开并发名额和全部权限限制。
 // - crontab、launchctl、at：在系统层排定时任务，等于在账本之外安排以后的工作。
 // - osascript：操控桌面；人规定桌面操作只经 Codex 指定模型。
+// 周用量过降档线时（P2-01）不起子 Agent：从允许清单拿掉，再显式禁用（工具现在叫 Agent，旧名 Task，两个都禁）。
+export const SUBAGENT_TOOLS = ["Task", "Agent"];
+
 export const EXECUTION_DISALLOWED = ["Bash(git push:*)", "Bash(gh pr create:*)", "Bash(gh pr merge:*)", "Bash(gh pr close:*)",
   "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)",
   "Bash(lark-cli:*)", "Bash(claude:*)", "Bash(codex:*)", "Bash(crontab:*)", "Bash(launchctl:*)", "Bash(at:*)", "Bash(osascript:*)"];
@@ -32,6 +37,7 @@ export interface ClaimResult {
   task: Task;
   agent: string;
   purpose: string;
+  subagents?: boolean;         // false：这一轮不准起子 Agent（P2-01 降档）
   run_id: string;              // 内核领活时签发
   feedback: string | null;     // 人的回答或退回意见，带进这一轮
   recovery?: string | null;    // 上一轮中断后的恢复说明（P1-14）
@@ -53,7 +59,8 @@ export interface WorkerOptions {
   log?: (line: string) => void;
   identity?: { worker: string; instance: string } | undefined;   // 启动报到用，须与客户端领活时带的一致
   reap?: (() => string[]) | undefined;                            // 启动时清理上个实例留下的 Agent 进程
-  exec?: Exec | undefined;                                        // 对外动作用的命令执行器（测试时换成假的）
+  exec?: Exec | undefined;                                        // 对外动作、建 worktree 用的命令执行器（测试时换成假的）
+  worktreeRoot?: string | undefined;                              // 设了就每任务一个 worktree（P2-02）
 }
 
 export class Worker {
@@ -61,6 +68,7 @@ export class Worker {
   private readonly adapters: Record<string, AgentAdapter>;
   private readonly workRoot: string;
   private readonly opts: WorkerOptions;
+  private prepLock: Promise<unknown> = Promise.resolve();   // 建 worktree 一个一个来：同一仓库上并发 fetch、worktree add 会抢锁
   constructor(kernel: KernelClient, adapters: Record<string, AgentAdapter>, workRoot: string, opts: WorkerOptions = {}) {
     this.kernel = kernel; this.adapters = adapters; this.workRoot = workRoot; this.opts = opts;
   }
@@ -72,20 +80,26 @@ export class Worker {
     if (this.opts.identity) await this.kernel.emit("worker.started", { ...this.opts.identity, reaped });
   }
 
-  // 一次领活。真正的循环由 main 用定时器驱动；每轮用完即退，不常驻 Agent 进程。
+  // 一次领活并跑完这一轮。真正的循环由 main 驱动；每轮用完即退，不常驻 Agent 进程。
   async once(agentName: string): Promise<boolean> {
+    const run = await this.begin(agentName);
+    if (!run) return false;
+    await run.done;
+    return true;
+  }
+
+  // 领一件活就开始跑，不等它跑完：返回这一轮的 Promise（包一层，async 函数会把返回的 Promise 摊平），没活可领返回 null。
+  // 并行（二期）靠这个：接单程序接着领，领不到为止；同时跑几个由内核按名额决定（P2-01），接单程序不另设上限。
+  async begin(agentName: string): Promise<{ done: Promise<void> } | null> {
     const a = await this.kernel.claim(agentName);
-    if (!a.task) return false;
-    this.log(`${a.run_id} 领到 ${a.task.id}${a.task.session_id ? `（接上会话 ${a.task.session_id}）` : ""}${a.recovery ? "，带恢复说明" : ""}`);
-    try {
-      await this.execute(agentName, a);
-    } catch (err) {
-      // 起不了进程之类的故障：交一张 failed 回执，由内核退避重试，任务不会卡在“执行中”。
+    if (!a.task) return null;
+    this.log(`${a.run_id} 领到 ${a.task.id}${a.task.session_id ? `（接上会话 ${a.task.session_id}）` : ""}${a.recovery ? "，带恢复说明" : ""}${a.subagents === false ? "，不起子 Agent" : ""}`);
+    return { done: this.execute(agentName, a).catch(async (err) => {
+      // 起不了进程、建不了 worktree 之类的故障：交一张 failed 回执，由内核退避重试，任务不会卡在“执行中”。
       const msg = (err as Error).message;
       this.log(`${a.run_id} 出错：${msg}`);
-      await this.receipt(a, null, { outcome: "failed", summary: `接单程序出错：${msg}`.slice(0, 300) });
-    }
-    return true;
+      await this.receipt(a, null, { outcome: "failed", summary: `接单程序出错：${msg}`.slice(0, 300) }).catch((e) => this.log(`${a.run_id} 交回执失败：${(e as Error).message}`));
+    }) };
   }
 
   // 一次领判断点（P1-10 主理人）：起一次不给工具的 Agent，取最后一条消息里的目标卡草稿交回内核。
@@ -132,24 +146,51 @@ export class Worker {
     return true;
   }
 
+  // 这一轮在哪个目录里做（P2-02）。第一轮之前建 worktree 并落账；以后每轮用账本里记的那个，被删了就在原分支上重建。
+  // 二期之前就开始了的任务（已经有会话、没有 worktree）照旧在 workRoot 里做：换目录会接不上原会话。
+  private async workspaceFor(a: ClaimResult): Promise<{ cwd: string; ws: Workspace | null }> {
+    const { task } = a;
+    const root = this.opts.worktreeRoot;
+    const fresh = !task.workdir && !task.session_id && !a.previous;
+    if (!root || !(fresh || (task.workdir && !existsSync(task.workdir)))) return { cwd: task.workdir ?? this.workRoot, ws: null };
+    const prep = this.prepLock.then(() => prepareWorkspace(task, this.workRoot, root, this.opts.exec ?? execReal, (s) => this.log(`${a.run_id} ${s}`)));
+    this.prepLock = prep.catch(() => {});
+    const ws = await prep;
+    if (!ws) return { cwd: task.workdir ?? this.workRoot, ws: null };   // workRoot 不是 git 仓库
+    await this.kernel.emit("workspace.prepared", { task_id: task.id, run_id: a.run_id, ...ws }, task.id);
+    this.log(`${a.run_id} 工作区 ${ws.path}（${ws.branch}，基底 ${ws.base}@${ws.base_commit.slice(0, 7)}）`);
+    return { cwd: ws.path, ws };
+  }
+
   private async execute(agentName: string, a: ClaimResult): Promise<void> {
-    const { task, run_id } = a;
+    const { run_id } = a;
     const adapter = this.adapters[agentName];
     if (!adapter) throw new Error(`没有 ${agentName} 的适配器`);
+    const { cwd, ws } = await this.workspaceFor(a);
+    const task: Task = { ...a.task, workdir: cwd === this.workRoot && !a.task.workdir ? null : cwd };
+    // 同一个工作区里还有别的进程（被判中断的上一轮的 Agent 还没停）：不起这一轮，免得两个 Agent 同时改一个目录（P2-03）。
+    if (task.workdir && this.opts.worktreeRoot) {
+      const stale = await staleProcesses(task.workdir, this.opts.exec ?? execReal).catch(() => []);
+      if (stale.length) throw new Error(`工作区 ${task.workdir} 里还有进程在跑（pid ${stale.join(", ")}），可能是上一轮被判中断后没停下的 Agent；等它结束或手动结束后再派`);
+    }
     const goal = await this.kernel.goal(task.goal_id);
     const profile = this.opts.profiles?.[agentName] ?? {};
+    const subagents = a.subagents !== false;
     let session: string | null = task.session_id;
     const recovery = a.recovery ?? undefined;
     const beat = () => this.kernel.emit("run.heartbeat", { run_id, task_id: task.id, ...(session ? { session_id: session } : {}) }, task.id);
     const base: Omit<RunRequest, "prompt"> = {
       // 一拿到会话编号就报一次，不等下一次心跳：轮次随后断掉时，恢复的那一轮才接得上原会话。
       onSession: (id) => { session = id; beat().catch(() => {}); },
-      cwd: task.workdir ?? this.workRoot,                         // TODO P2：每任务一个 worktree
+      cwd,
       model: profile.model, permission_mode: profile.permission_mode ?? EXECUTION_PERMISSION_MODE,
       timeout_ms: runLimitMinutes(task) * 60_000, label: run_id,   // 剩下的时长预算（P1-13）
-      tools: EXECUTION_TOOLS, disallowed_tools: EXECUTION_DISALLOWED,
+      tools: subagents ? EXECUTION_TOOLS : EXECUTION_TOOLS.filter((t) => !SUBAGENT_TOOLS.includes(t)),
+      disallowed_tools: subagents ? EXECUTION_DISALLOWED : [...EXECUTION_DISALLOWED, ...SUBAGENT_TOOLS],
     };
-    const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery }); // TODO P2：按范围匹配定论
+    const workspace = ws ?? (task.workdir ? { path: task.workdir } : undefined);
+    const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery,
+      workspace, subagents }); // TODO P2-07：按范围匹配定论
 
     // 心跳：定期报到，顺便看内核是否已取消本轮（人说“停”），是就结束进程组。
     const stop = new AbortController();
@@ -163,7 +204,7 @@ export class Worker {
     let res: RunResult;
     try {
       if (task.session_id) {
-        res = await adapter.run({ ...base, prompt: buildResumePrompt({ task, feedback: a.feedback ?? undefined, recovery }), session_id: task.session_id }, stop.signal);
+        res = await adapter.run({ ...base, prompt: buildResumePrompt({ task, feedback: a.feedback ?? undefined, recovery, subagents }), session_id: task.session_id }, stop.signal);
         // 原会话接不上（已被清理或过期）：开新会话，带完整上下文包重来。
         if (!res.session_id && !res.last_message && !stop.signal.aborted) {
           this.log(`${run_id} 会话 ${task.session_id} 接不上，开新会话`);
@@ -203,7 +244,7 @@ export class Worker {
 
   private async receipt(a: ClaimResult, res: RunResult | null, receipt: Receipt): Promise<void> {
     // Agent 自己建的 worktree 随回执报上去（P1-28），内核在审核卡上列出、任务结束后排清理。查不到就算了，不挡回执。
-    const worktrees = await taskWorktrees(a.task.id, a.task.workdir ?? this.workRoot, this.opts.exec ?? execReal).catch(() => []);
+    const worktrees = await taskWorktrees(a.task.id, a.task.workdir && existsSync(a.task.workdir) ? a.task.workdir : this.workRoot, this.opts.exec ?? execReal).catch(() => []);
     await this.kernel.emit("run.receipt", { task_id: a.task.id, run_id: a.run_id, session_id: res?.session_id ?? a.task.session_id ?? undefined,
       receipt: { ...receipt, usage: res?.usage }, ...(worktrees.length ? { worktrees } : {}) }, a.task.id);
     this.log(`${a.run_id} 交回执：${receipt.outcome} ${receipt.summary}`);
