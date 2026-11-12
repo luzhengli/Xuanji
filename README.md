@@ -69,7 +69,7 @@
 ## 快速开始
 
 ```sh
-git clone <本仓库地址> xuanji && cd xuanji
+git clone https://github.com/luzhengli/Xuanji.git && cd Xuanji
 npm install                 # 只装开发依赖，用于类型检查
 npm test                    # 全部用例离线运行，不调用任何 Agent
 
