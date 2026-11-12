@@ -265,3 +265,19 @@ test("接单程序：经本机接口领对外动作、执行、报结果，审�
     assert.match(k.cards()[0]!.body, /^对外动作：推分支 origin\/xj\/T-1-pow：origin\/xj\/T-1-pow@abcdef1/);
   } finally { server.close(); k.close(); }
 });
+
+test("系统起的 Claude Code 进程和人的个人配置隔开；执行轮用允许清单，禁掉绕开内核的命令；判断点什么工具都没有", async () => {
+  const { ISOLATION_ARGS } = await import("../src/worker/adapters/claude-code.ts");
+  const { EXECUTION_TOOLS, EXECUTION_PERMISSION_MODE } = await import("../src/worker/worker.ts");
+  const exec = buildArgs({ prompt: "p", cwd: "/tmp", timeout_ms: 1, tools: EXECUTION_TOOLS, disallowed_tools: EXECUTION_DISALLOWED, permission_mode: EXECUTION_PERMISSION_MODE });
+  const judge = buildArgs({ prompt: "p", cwd: "/tmp", timeout_ms: 1, tools: [] });
+  for (const a of [exec, judge]) {
+    assert.deepEqual(a.slice(a.indexOf("--setting-sources"), a.indexOf("--setting-sources") + 3), ISOLATION_ARGS);
+  }
+  const tools = exec[exec.indexOf("--tools") + 1]!.split(",");
+  assert.ok(tools.includes("Task") && tools.includes("Bash"));
+  for (const t of ["CronCreate", "ScheduleWakeup", "RemoteTrigger", "Monitor", "SendMessage", "ListAgents", "EnterWorktree", "Skill"]) assert.ok(!tools.includes(t), t);
+  for (const c of ["lark-cli", "claude", "codex", "crontab", "launchctl", "osascript"]) assert.ok(EXECUTION_DISALLOWED.includes(`Bash(${c}:*)`), c);
+  assert.equal(exec[exec.indexOf("--permission-mode") + 1], "auto");
+  assert.equal(judge[judge.indexOf("--tools") + 1], "");
+});

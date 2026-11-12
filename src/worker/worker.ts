@@ -10,10 +10,23 @@ import { runEffect, execReal, taskWorktrees, type Exec } from "./effects.ts";
 // 判断点一轮最多跑多久。内核那边 5 分钟没结果判失败（JUDGMENT_TIMEOUT_MS），这里先结束进程。
 export const JUDGMENT_RUN_MS = 180_000;
 
-// 执行的 Agent 不能自己做对外动作：推送和改 PR 的命令禁掉，写进回执的 effects 由接单程序代为执行（P1-21）。
-// 这是尽力而为的拦截（换个写法的命令拦不住），真正的边界仍是沙箱和权限模式；查看类命令（gh pr view/list）不拦。
+// 执行轮按角色给最小权限（2026-11-12 人定）。用允许清单而不是禁用清单：Claude Code 升级会悄悄加新工具
+// （实测已有 Cron、ScheduleWakeup、RemoteTrigger、Monitor、SendMessage、EnterWorktree），允许清单下新工具默认拿不到。
+// 子 Agent（Task）允许，不拆的大任务靠它；联网查资料允许，外部文字当资料。
+export const EXECUTION_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task", "WebFetch", "WebSearch", "TodoWrite"];
+
+// 不加载人的个人设置后，权限放行规则也没了；无界面下没人点“允许”，所以执行轮显式用 auto（人的个人设置原本就是 auto）。
+export const EXECUTION_PERMISSION_MODE = "auto";
+
+// Bash 里能绕开内核的命令禁掉。这是尽力而为的拦截（按前缀匹配，换个写法拦不住），真正的边界仍是沙箱。
+// - 推送、改 PR：写进回执的 effects，由接单程序代为执行（P1-21）。查看类命令（gh pr view/list）不拦。
+// - lark-cli：接单程序的环境里它已以机器人身份登录，能直接给人发飞书消息，是绕过内核的对外通道。
+// - claude、codex：再起一个 Agent 会绕开并发名额和全部权限限制。
+// - crontab、launchctl、at：在系统层排定时任务，等于在账本之外安排以后的工作。
+// - osascript：操控桌面；人规定桌面操作只经 Codex 指定模型。
 export const EXECUTION_DISALLOWED = ["Bash(git push:*)", "Bash(gh pr create:*)", "Bash(gh pr merge:*)", "Bash(gh pr close:*)",
-  "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)"];
+  "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)",
+  "Bash(lark-cli:*)", "Bash(claude:*)", "Bash(codex:*)", "Bash(crontab:*)", "Bash(launchctl:*)", "Bash(at:*)", "Bash(osascript:*)"];
 
 export interface ClaimResult {
   task: Task;
@@ -132,9 +145,9 @@ export class Worker {
       // 一拿到会话编号就报一次，不等下一次心跳：轮次随后断掉时，恢复的那一轮才接得上原会话。
       onSession: (id) => { session = id; beat().catch(() => {}); },
       cwd: task.workdir ?? this.workRoot,                         // TODO P2：每任务一个 worktree
-      model: profile.model, permission_mode: profile.permission_mode,
+      model: profile.model, permission_mode: profile.permission_mode ?? EXECUTION_PERMISSION_MODE,
       timeout_ms: runLimitMinutes(task) * 60_000, label: run_id,   // 剩下的时长预算（P1-13）
-      disallowed_tools: EXECUTION_DISALLOWED,                       // 对外动作由系统代为执行（P1-21）
+      tools: EXECUTION_TOOLS, disallowed_tools: EXECUTION_DISALLOWED,
     };
     const fresh = () => buildPrompt({ task, goal, rulings: [], previous: a.previous ?? undefined, feedback: a.feedback ?? undefined, recovery }); // TODO P2：按范围匹配定论
 

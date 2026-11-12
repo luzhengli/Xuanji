@@ -254,7 +254,10 @@ test("回执重写的真实输出：不给工具、同一会话，交回合法�
     const adapter: AgentAdapter = { name: "claude", run: async (req) => { seen.push(req); return outputs.shift()!; } };
     await client.emit("goal.confirmed", { title: "sq" });
     await new Worker(client, { claude: adapter }, tmpdir(), { log: () => {} }).once("claude");
-    assert.deepEqual(buildArgs(seen[1]!).slice(-4, -1), ["--tools", "", "--"]);
+    const a = buildArgs(seen[1]!);
+    assert.equal(a[a.indexOf("--tools") + 1], "", "重写回执不给工具");
+    assert.ok(!a.includes("--disallowedTools"));
+    assert.equal(a.at(-2), "--");
     assert.equal(kernel.task("T-1")!.state, "awaiting_review");
     assert.equal(kernel.run("RN-1")!.session_id, "758bb8e1-556e-44c4-a8dc-3c28404f28c3");
   } finally { server.close(); kernel.close(); }
@@ -309,4 +312,15 @@ test("机器睡眠后醒来：定时器来源先补 timer.resumed，看门狗不
   assert.equal(k.run(c.run_id)!.status, "running", "醒来的第一次 tick 不判");
   tick(k, at(40 * MIN + HEARTBEAT_TIMEOUT_MS + 1_000));
   assert.equal(k.run(c.run_id)!.status, "lost", "宽限过后仍没心跳才判");
+});
+
+test("事件流里数出起子 Agent 的次数，随用量上报", () => {
+  const line = (content: unknown[]) => JSON.stringify({ type: "assistant", message: { content } });
+  const r = parseStream([
+    line([{ type: "tool_use", name: "Task", input: {} }, { type: "tool_use", name: "Bash", input: {} }]),
+    line([{ type: "tool_use", name: "Agent", input: {} }]),
+    JSON.stringify({ type: "result", result: "{}", session_id: "s", usage: {} }),
+  ].join("\n"));
+  assert.equal(r.usage.subagents, 2);
+  assert.equal(parseStream(JSON.stringify({ type: "result", result: "{}", session_id: "s" })).usage.subagents, undefined);
 });

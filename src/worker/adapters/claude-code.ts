@@ -14,8 +14,19 @@ export interface ClaudeCodeOptions {
   pidDir?: string | undefined;      // 设了就为每个在跑的 Agent 进程组留一个 pid 文件，接单程序重启时据此清理孤儿进程
 }
 
+// 系统起的每一个 Claude Code 进程都和人的个人配置隔开（2026-11-12 人定“按你说的来”）：
+// 不加载用户级设置（人的 hooks、插件、权限放行规则），不加载任何 MCP。项目级设置照常，那是工作仓库自己的。
+// 不能用 --bare：它只认 API Key、不读订阅登录，和“走订阅不走 API”冲突。
+export const ISOLATION_ARGS = ["--setting-sources", "project,local", "--strict-mcp-config"];
+
+// 人在个人设置里关掉的遥测和上报，系统起的进程照样关（不加载用户设置后要自己带上）。
+export const PRIVACY_ENV: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1",
+  DISABLE_BUG_COMMAND: "1", CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
+};
+
 export function buildArgs(req: RunRequest): string[] {
-  const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  const args = ["-p", "--output-format", "stream-json", "--verbose", ...ISOLATION_ARGS];
   if (req.session_id) args.push("--resume", req.session_id);
   if (req.model) args.push("--model", req.model);
   if (req.tools) args.push("--tools", req.tools.join(","));
@@ -37,7 +48,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     const args = buildArgs(req);
     return new Promise((resolve, reject) => {
       // 自成一个进程组：停止时连同 Agent 起的子进程一起结束。
-      const child = spawn(this.bin, args, { cwd: req.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      const child = spawn(this.bin, args, { cwd: req.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true, env: { ...process.env, ...PRIVACY_ENV } });
       let out = "", err = "", stopped = false, session: string | null = null;
       const pidFile = this.pidDir && child.pid ? join(this.pidDir, `${req.label ?? child.pid}.pid`) : null;
       if (pidFile) { mkdirSync(this.pidDir!, { recursive: true }); writeFileSync(pidFile, String(child.pid)); }
@@ -92,7 +103,7 @@ export function reapOrphans(pidDir: string, bin = "claude"): string[] {
 export function parseStream(ndjson: string): Omit<RunResult, "exit_code" | "stderr"> {
   let last_message = "", session_id: string | null = null, usage: Record<string, unknown> = {};
   let lastText = "", sawResult = false;
-  let rate_limit: RunResult["rate_limit"], rate_limited = false;
+  let rate_limit: RunResult["rate_limit"], rate_limited = false, subagents = 0;
   for (const line of ndjson.split("\n")) {
     if (!line.trim()) continue;
     let ev: Record<string, unknown>;
@@ -100,7 +111,9 @@ export function parseStream(ndjson: string): Omit<RunResult, "exit_code" | "stde
     if (ev.type === "system" && ev.subtype === "init" && !session_id) {
       session_id = (ev.session_id as string) ?? null;   // 没有 result（中途被结束）时也知道是哪个会话
     } else if (ev.type === "assistant") {
-      const content = (ev.message as { content?: { type: string; text?: string }[] } | undefined)?.content ?? [];
+      const content = (ev.message as { content?: { type: string; text?: string; name?: string }[] } | undefined)?.content ?? [];
+      // 起子 Agent 的次数（Task / Agent 工具），随用量上报，看会话内并行吃了多少额度。
+      subagents += content.filter((c) => c.type === "tool_use" && (c.name === "Task" || c.name === "Agent")).length;
       const text = content.filter((c) => c.type === "text" && c.text).map((c) => c.text).join("");
       if (text) lastText = text;
     } else if (ev.type === "result") {
@@ -121,5 +134,6 @@ export function parseStream(ndjson: string): Omit<RunResult, "exit_code" | "stde
   // 没有完整的 result 行：用最后一条 assistant 文本。2026-11-12 实测：读端停住时管道写满，
   // Claude Code 退出时最后一行只写出一半，而回执就在它前面那条 assistant 消息里。
   if (!sawResult) last_message = lastText;
+  if (subagents) usage = { ...usage, subagents };
   return { last_message, session_id, usage, rate_limit, rate_limited };
 }

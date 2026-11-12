@@ -63,6 +63,16 @@
 - [x] P1-30 “发现”知会卡跨任务重复：同一件事（feat/greet 有未提交改动）T-10、T-11 各出一张（C-31、C-35）。出处：入口 / 注意力调度。2026-11-12 发现；去重键现在带任务编号。2026-11-12 完成：别的任务报过、还开着的同名“发现”照常建卡、立即收起，`xj why` 注明和哪张重复。不直接不建，是因为重放旧账本时卡片编号要不变（C-36 的回答引用编号）。真实账本重放：只有 C-35 变成收起。措辞不同的同一件事（C-19、C-23）认不出，三期研判再说
 - [x] P1-31 开源用的 README.md。2026-11-12 人要求。2026-11-12 完成：项目介绍、架构、一期能力、环境要求、快速开始、配置、飞书通道、xj、launchd 部署、备份、安全、开发、致谢
 - [x] P1-32 开源推送前的清理。2026-11-12 写 README 时发现：（1）没有 LICENSE，README 里写着“待定”，要人选许可证；（2）`test/fixtures/` 的真实录制件里有人的飞书 open_id（`ou_0000…`）、私聊 chat_id（`oc_0000…`）和本机路径 `/Users/me`，要人决定是否脱敏；（3）`docs/` 和 AGENTS.md 是自用的工作记录，要人决定是否随仓库公开。2026-11-12 人定：MIT；脱敏并改写历史；docs 继续公开。完成：加 `LICENSE`（MIT），README 和 `package.json` 写明；录制件、测试、文档里的 open_id、chat_id、应用编号、`/Users/<用户名>` 换成占位符，`git filter-branch` 改写全部 12 个提交，强推 `main`；改写前的原样打包在本机 `~/xj-pre-scrub-20261112.bundle`
+- [x] P1-33 系统起的 Agent 按角色给最小权限，和人的个人配置隔开。出处：安全、权限与成本。2026-11-12 结束一期后追加的安全补漏，人定“按你说的来”。
+  - 起因：实测看到无界面执行轮能用 Cron、ScheduleWakeup、RemoteTrigger、Monitor、SendMessage、ListAgents、EnterWorktree；Bash 里还能调已登录的 lark-cli、再起 claude/codex、用 crontab/launchctl 排定时任务。
+  - 做法：
+    - 执行轮用允许清单 `EXECUTION_TOOLS`，Bash 禁用规则补上上面那些命令（`src/worker/worker.ts`）。
+    - 所有 Claude Code 进程加 `--setting-sources project,local --strict-mcp-config`，带上人设置里的 5 个隐私环境变量（`claude-code.ts`）。
+    - 执行轮权限模式显式用 auto：原来靠人的个人设置。
+    - 回执约定加“子 Agent 同时最多 3 个”；事件流里数 Task/Agent 调用，记进 `usage.subagents`。
+  - 真实实测（haiku）：init 里工具正好是允许清单，MCP 为空，`apiKeySource: none`（订阅登录正常）；子 Agent 能起，`lark-cli`、`crontab` 在主会话和子 Agent 里都被拒绝。
+  - 没禁的：内置的 3 个插件（agents-md、privacy、plugin-authoring）照样加载，它们不来自用户设置。
+  - Codex 验证轮的参数（`--ignore-user-config`、只读、关 web search）留到写 Codex 适配器时一起做，见二期。
 
 ## 二期 · 并行
 

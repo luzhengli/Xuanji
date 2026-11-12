@@ -101,7 +101,8 @@ test("验收 2：问人路径：ask 回执出决策卡；xj answer 后下一轮 
     const [first, second] = h.adapter.requests;
     assert.equal(first!.session_id, undefined);
     assert.equal(second!.session_id, "9b5d5284-9463-4bd1-a1f6-eb19f3d11ab4", "第二轮带着第一轮的会话编号");
-    assert.deepEqual(buildArgs(second!).slice(4, 6), ["--resume", "9b5d5284-9463-4bd1-a1f6-eb19f3d11ab4"]);
+    const a2 = buildArgs(second!);
+    assert.equal(a2[a2.indexOf("--resume") + 1], "9b5d5284-9463-4bd1-a1f6-eb19f3d11ab4");
     assert.match(second!.prompt, /的回答：中文；说明：用“你好，<name>！”这种格式/, "回答作为反馈带进下一轮");
 
     const o = await h.xjJson<Overview>("status");
