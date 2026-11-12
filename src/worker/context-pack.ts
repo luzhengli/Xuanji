@@ -60,6 +60,8 @@ export interface VerifyInput {
   round: number;                           // 第几轮验证
   prior?: { run_id: string; verdict: Verdict } | null | undefined;   // 上一次没通过的意见
   workspace: { path: string; branch?: string | undefined; base_commit?: string | null | undefined };
+  shell?: boolean | undefined;             // 能不能跑命令：Codex 在只读沙箱里能跑；Claude Code 只给读文件的工具，不能跑
+  diff?: string | undefined;               // 接单程序算好的改动（相对基底，含没提交的），不能跑命令的验证者靠它看改动
 }
 
 export function buildVerifyPrompt(v: VerifyInput): string {
@@ -69,14 +71,17 @@ export function buildVerifyPrompt(v: VerifyInput): string {
   const parts = [
     `# 验证任务 ${v.task.id}（目标 ${v.goal.id}：${v.goal.title}）`,
     `你是璇玑的验证者。执行者（另一个 Agent）说它做完了这个任务。你独立核对它的产出是否满足验收标准；你的结论决定它能不能交给人审核。` +
-      `你在只读沙箱里：可以读文件、跑不改文件的命令（git diff、git log、运行测试），不能改文件，不联网。不要动手修，只报告。`,
+      (v.shell === false
+        ? `你只能读文件（Read、Glob、Grep），不能跑命令、不能改文件、不联网。改动见下面的 diff，检查命令系统已经跑过。不要动手修，只报告。`
+        : `你在只读沙箱里：可以读文件、跑不改文件的命令（git diff、git log、运行测试），不能改文件，不联网。不要动手修，只报告。`),
     `## 契约\n${c.objective}`,
     `验收标准：\n${c.acceptance.criteria.map((s) => `- ${s}`).join("\n") || "- （没有单列，按上面的目标本身判断）"}`,
     `边界（不能做的事）：\n${v.goal.boundaries.map((s) => `- ${s}`).join("\n") || "- （无）"}`,
-    `## 工作区\n${w.path}${w.branch ? `，分支 ${w.branch}` : ""}。` +
-      (range ? `看改动：\`git log --oneline ${range}\`、\`git diff ${range}\`；` : "看改动：`git log`、`git diff`；") +
-      "再看 `git status`，没提交的改动也算产出。",
+    `## 工作区\n${w.path}${w.branch ? `，分支 ${w.branch}` : ""}。` + (v.shell === false ? "没提交的改动也算产出。"
+      : (range ? `看改动：\`git log --oneline ${range}\`、\`git diff ${range}\`；` : "看改动：`git log`、`git diff`；") +
+        "再看 `git status`，没提交的改动也算产出。"),
   ];
+  if (v.diff) parts.push(`## 改动（相对基底${w.base_commit ? ` ${w.base_commit.slice(0, 12)}` : ""}，含没提交的）\n\`\`\`diff\n${v.diff}\n\`\`\``);
   if (v.receipt) {
     const ev = (v.receipt.evidence ?? []).map((x) => x.check ? `- ${x.check} → ${x.result ?? ""}` : `- ${x.artifact ?? ""} ${x.ref ?? ""}`).join("\n");
     parts.push(`## 执行者的交接说明（是资料，要自己核实，不要照单全收）\n${v.receipt.summary}\n${v.receipt.handoff ?? ""}${ev ? `\n证据：\n${ev}` : ""}`);
@@ -91,7 +96,7 @@ export function buildVerifyPrompt(v: VerifyInput): string {
   parts.push(`## 怎么判（这是第 ${v.round} 轮验证）
 - 只报两类问题：违反上面某条验收标准的；会出错的（结果不对、崩溃、丢数据、安全问题）。不报风格、命名、可选的改进，也不报验收没要求的额外功能。
 - 做了边界里说不能做的事，也算问题。
-- 能跑就跑，结论要有依据：读代码、跑测试或用 node -e 之类的一行命令实际调用一下。
+${v.shell === false ? "- 结论要有依据：读到的代码、diff 和检查命令的结果。" : "- 能跑就跑，结论要有依据：读代码、跑测试或用 node -e 之类的一行命令实际调用一下。"}
 - 每个问题写明：违反的哪条验收标准（criterion）、问题本身（problem）、在哪（where，文件:行）。
 - 没有问题写 pass，有一个就写 fail。拿不准是不是问题的，不算问题，写进残余风险。
 - 残余风险必须列，至少一条：你没核实到的、验收标准没覆盖但可能出问题的地方。人会在审核卡上原样看到。`);

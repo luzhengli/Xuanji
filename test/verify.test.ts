@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Kernel } from "../src/kernel/kernel.ts";
@@ -152,12 +153,33 @@ test("P2-05：检查命令照用 Bash 禁用规则，命令里任何一段命中
 
 // ---- P2-05 内核：验证在人之前 ----
 
-test("P2-05：选验证者——kinds 有 review、不是同一个 Agent、档位不低于执行者；没有就不验证", () => {
+test("P2-05：选验证者——优先不同的 Agent，没有就用同一个 Agent（独立会话）；档位不低于执行者；没有 review 的档案就不验证", () => {
+  const claude = DEFAULTS.agents.claude!;
+  const selfReview = { ...claude, kinds: [...claude.kinds, "review" as const] };
   assert.equal(chooseVerifier(cfg(), "claude"), "codex");
-  assert.equal(chooseVerifier(cfg(), "codex"), null, "执行者自己不能验证");
-  assert.equal(chooseVerifier(cfg({ claude: DEFAULTS.agents.claude!, codex: { ...CODEX, tier: "light" } }), "claude"), null, "档位低于执行者");
-  assert.equal(chooseVerifier(cfg({ claude: DEFAULTS.agents.claude!, claude2: { ...DEFAULTS.agents.claude!, kinds: ["review"] } }), "claude"), null, "同一个 Agent 的另一个档案也不行");
-  assert.equal(chooseVerifier(DEFAULTS, "claude"), null);
+  // 不同的 Agent 优先，哪怕同一个 Agent 的档案排在前面、执行者自己也能验证。
+  assert.equal(chooseVerifier(cfg({ claude: selfReview, claude2: { ...claude, kinds: ["review"] }, codex: CODEX }), "claude"), "codex");
+  // 没有别的 Agent：同一个 Agent 的另一个档案优先，其次执行者自己的档案（2026-11-12 人定：可以同一个 Agent，独立会话）。
+  assert.equal(chooseVerifier(cfg({ claude: selfReview, claude2: { ...claude, kinds: ["review"] } }), "claude"), "claude2");
+  assert.equal(chooseVerifier(cfg({ claude: selfReview }), "claude"), "claude");
+  assert.equal(chooseVerifier(cfg(), "codex"), "codex", "Codex 执行时也可以自己验证");
+  assert.equal(chooseVerifier(cfg({ claude, codex: { ...CODEX, tier: "light" } }), "claude"), null, "档位低于执行者");
+  assert.equal(chooseVerifier(DEFAULTS, "claude"), null, "没有档案的 kinds 有 review");
+});
+
+test("P2-05：同一个 Agent 验证——执行完由同一个档案领验证，开新会话；名额照算", () => {
+  const claude = { ...DEFAULTS.agents.claude!, kinds: [...DEFAULTS.agents.claude!.kinds, "review" as const] };
+  const k = new Kernel(cfg({ claude }), ":memory:");
+  ev(k, "goal.confirmed", { title: "x" });
+  const c = k.claim("claude", T0, sid())!;
+  ev(k, "run.receipt", { run_id: c.run_id, task_id: "T-1", session_id: "EXEC", receipt: { outcome: "done", summary: "好了", handoff: "h" } }, "worker");
+  assert.equal(k.task("T-1")!.verify_due, "claude");
+  const v = k.claim("claude", T0, sid())!;
+  assert.equal(v.purpose, "verify");
+  verdict(k, v.run_id, "T-1", true, T0, { session_id: "VERIFY" });
+  assert.equal(k.run(v.run_id)!.session_id, "VERIFY");
+  assert.equal(k.task("T-1")!.session_id, "EXEC", "任务的会话还是执行者的，验证的会话不混进去");
+  assert.equal(k.task("T-1")!.state, "awaiting_review");
 });
 
 test("P2-05：done → 等验证（内核按配置写验证者，接单程序带来的不算）→ codex 领验证 → 通过出审核卡，残余风险原样展示", () => {
@@ -449,6 +471,54 @@ test("P2-05：接单程序——检查命令没过就不请验证者，直接按
   const t = k.task("T-1")!;
   assert.equal(t.state, "queued");
   assert.match(t.feedback!, /`npm test` 退出码 1：AssertionError: 1 !== 1.5/);
+});
+
+// 真的 git 仓库：基底一个提交，执行者在上面又提交了一个。
+function gitRepo(): { dir: string; base: string } {
+  const dir = mkdtempSync(join(tmpdir(), "xj-verify-repo-"));
+  const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", ...a], { cwd: dir, encoding: "utf8" }).trim();
+  git("init", "-q");
+  writeFileSync(join(dir, "math.mjs"), "export const add = (a, b) => a + b;\n");
+  git("add", "."); git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+  writeFileSync(join(dir, "math.mjs"), "export const add = (a, b) => a + b;\nexport const half = (a) => Math.floor(a / 2);\n");
+  git("commit", "-qam", "half");
+  return { dir, base };
+}
+
+test("P2-05：Claude Code 当验证者——只给读文件的工具，不能跑命令，改动写进提示词", async () => {
+  const claude = { ...DEFAULTS.agents.claude!, kinds: [...DEFAULTS.agents.claude!.kinds, "review" as const] };
+  const k = new Kernel(cfg({ claude }), ":memory:");
+  ev(k, "goal.confirmed", { title: "half", acceptance: ["half(3) 返回 1.5"] });
+  const c = k.claim("claude", T0, sid())!;
+  const { dir, base } = gitRepo();
+  k.db.prepare(`UPDATE tasks SET workdir = ?, base_commit = ? WHERE id = 'T-1'`).run(dir, base);
+  done(k, c.run_id, "T-1");
+  const fake = new FakeCodex([JSON.stringify({ verdict: "fail", summary: "取整了", issues: [{ problem: "half(3) 是 1" }], risks: ["r"] })]);
+  const w = new Worker(local(k), { claude: fake }, "/tmp", { profiles: { claude }, heartbeatMs: 60_000, log: () => {} });
+  await w.once("claude");
+  const req = fake.requests[0]!;
+  assert.deepEqual(req.tools, ["Read", "Glob", "Grep"]);
+  assert.equal(req.session_id, undefined, "开新会话，不接执行者的会话");
+  assert.match(req.prompt, /你只能读文件（Read、Glob、Grep），不能跑命令/);
+  assert.match(req.prompt, /```diff\n[\s\S]*\+export const half = \(a\) => Math\.floor\(a \/ 2\);/);
+  assert.doesNotMatch(req.prompt, /能跑就跑/);
+  assert.equal(k.task("T-1")!.state, "queued");
+});
+
+test("P2-05：验证者动了工作区——这次结论不算数，任务留在验证中", async () => {
+  const k = verifyingTask();
+  const { dir, base } = gitRepo();
+  k.db.prepare(`UPDATE tasks SET workdir = ?, base_commit = ? WHERE id = 'T-1'`).run(dir, base);
+  const sneaky: AgentAdapter = { name: "codex", run: async (req) => {
+    writeFileSync(join(req.cwd, "math.mjs"), "export const half = (a) => a / 2;\n");   // 动手“修”了
+    return { last_message: JSON.stringify({ verdict: "pass", summary: "好", issues: [], risks: ["r"] }), session_id: "CS", exit_code: 0, usage: {}, rate_limited: false, stderr: "" };
+  } };
+  const w = new Worker(local(k), { codex: sneaky }, "/tmp", { profiles: { codex: CODEX }, heartbeatMs: 60_000, log: () => {} });
+  await w.once("codex");
+  assert.equal(k.task("T-1")!.state, "verifying");
+  assert.match(k.run("RN-2")!.lost_reason!, /验证者改动了工作区/);
+  assert.equal(cardsOf(k, "T-1").length, 0);
 });
 
 test("P2-05：接单程序——验证者起不来，交带错误的结论，任务留在验证中", async () => {

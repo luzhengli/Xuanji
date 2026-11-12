@@ -36,6 +36,11 @@ export const EXECUTION_DISALLOWED = ["Bash(git push:*)", "Bash(gh pr create:*)",
   "Bash(gh pr edit:*)", "Bash(gh pr comment:*)", "Bash(gh pr review:*)", "Bash(gh repo create:*)", "Bash(gh release:*)",
   "Bash(lark-cli:*)", "Bash(claude:*)", "Bash(codex:*)", "Bash(crontab:*)", "Bash(launchctl:*)", "Bash(at:*)", "Bash(osascript:*)"];
 
+// Claude Code 当验证者时只给读文件的工具（P2-05）：它没有 Codex 那样的只读沙箱，给了 Bash 就能改文件。
+// 不能跑命令，改动由接单程序算好写进提示词，测试由检查命令那一层跑。
+export const VERIFY_READ_TOOLS = ["Read", "Glob", "Grep"];
+const VERIFY_DIFF_MAX = 12_000;
+
 // 检查命令（P2-05）：一条最多跑 10 分钟，输出只留末尾。
 export const CHECK_TIMEOUT_MS = 600_000;
 const CHECK_OUTPUT_MAX = 2_000;
@@ -87,7 +92,7 @@ export interface KernelClient {
 }
 
 export interface WorkerOptions {
-  profiles?: Record<string, { model?: string | undefined; permission_mode?: string | undefined; effort?: string | undefined }>;
+  profiles?: Record<string, { use?: string | undefined; model?: string | undefined; permission_mode?: string | undefined; effort?: string | undefined }>;
   heartbeatMs?: number;
   log?: (line: string) => void;
   identity?: { worker: string; instance: string } | undefined;   // 启动报到用，须与客户端领活时带的一致
@@ -306,11 +311,23 @@ export class Worker {
       if (verdict) this.log(`${run_id} 检查命令没过，不请验证者`);
       else if (!stop.signal.aborted) {
         const branch = (task.worktrees ? JSON.parse(task.worktrees) as Worktree[] : []).find((w) => w.path === cwd)?.branch;
-        const base = { cwd, model: profile.model, effort: profile.effort, sandbox: "read-only" as const, tools: [] as string[],
+        // Codex 在只读沙箱里能跑命令；Claude Code 只给读文件的工具（同一个 Agent 也可以验证，开新会话，2026-11-12 人定）。
+        const shell = profile.use !== "claude";
+        const base = { cwd, model: profile.model, effort: profile.effort, sandbox: "read-only" as const,
+          tools: shell ? [] as string[] : VERIFY_READ_TOOLS, ...(shell ? {} : { permission_mode: profile.permission_mode ?? EXECUTION_PERMISSION_MODE }),
           onSession: (id: string) => { session = id; beat().catch(() => {}); } };
+        const exec = this.opts.exec ?? execReal;
+        const diff = await workspaceDiff(cwd, task.base_commit ?? null, exec);
+        const before = await workspaceState(cwd, exec);
         res = await adapter.run({ ...base, label: run_id, timeout_ms: Math.max(60_000, deadline - Date.now()),
           prompt: buildVerifyPrompt({ task, goal, receipt: a.previous, checks, round: a.verify?.round ?? 1, prior: a.verify?.prior,
-            workspace: { path: cwd, branch, base_commit: task.base_commit } }) }, stop.signal);
+            workspace: { path: cwd, branch, base_commit: task.base_commit }, shell, diff: diff ?? undefined }) }, stop.signal);
+        // 验证者只读：前后比一下工作区，动过就不认这次结论（不管是哪个 Agent，沙箱和工具限制之外再兜一层）。
+        const after = await workspaceState(cwd, exec);
+        if (before !== null && after !== before) {
+          this.log(`${run_id} 验证者改动了工作区，这次结论不算数`);
+          throw new Error("验证者改动了工作区（HEAD 或 git status 变了），这次结论不算数；请人看一眼工作区");
+        }
         if (res.rate_limit) await this.kernel.emit("quota.observed", { agent: agentName, ...res.rate_limit });
         if (!res.rate_limited && !res.stopped) {
           let parsed = parseVerdict(res.last_message);
@@ -377,4 +394,23 @@ export class Worker {
   }
 
   private log(line: string) { (this.opts.log ?? ((s: string) => console.log(`[worker] ${s}`)))(line); }
+}
+
+// 验证者看的改动：相对基底提交（含没提交的），没有基底就相对 HEAD。不是 git 仓库返回 null。
+export async function workspaceDiff(cwd: string, baseCommit: string | null, exec: Exec): Promise<string | null> {
+  const ref = baseCommit && /^[0-9a-f]{7,40}$/.test(baseCommit) ? baseCommit : "HEAD";
+  const r = await exec("git", ["diff", "--no-color", "--no-ext-diff", ref], cwd).catch(() => null);
+  if (!r || r.code) return null;
+  const st = await exec("git", ["status", "--porcelain"], cwd).catch(() => null);
+  const untracked = (st?.stdout ?? "").split("\n").filter((l) => l.startsWith("?? ")).map((l) => l.slice(3));
+  const text = `${r.stdout.trim() || "（没有改动）"}${untracked.length ? `\n\n没纳入 git 的新文件：${untracked.join("、")}` : ""}`;
+  return text.length > VERIFY_DIFF_MAX ? `${text.slice(0, VERIFY_DIFF_MAX)}\n…（太长，后面截掉了，自己读文件看）` : text;
+}
+
+// 工作区的状态指纹：HEAD 加 git status。不是 git 仓库返回 null（不比）。
+export async function workspaceState(cwd: string, exec: Exec): Promise<string | null> {
+  const head = await exec("git", ["rev-parse", "HEAD"], cwd).catch(() => null);
+  const st = await exec("git", ["status", "--porcelain"], cwd).catch(() => null);
+  if (!head || head.code || !st || st.code) return null;
+  return `${head.stdout.trim()}\n${st.stdout}`;
 }

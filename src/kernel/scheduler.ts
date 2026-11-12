@@ -76,15 +76,17 @@ function verifyBusy(db: DB, taskId: string): boolean {
     || !!db.prepare(`SELECT 1 FROM effects WHERE task_id = ? AND status IN ('queued','running') AND kind != 'remove-worktree'`).get(taskId);
 }
 
-// 落账 done 回执时选验证者（P2-05）：kinds 有 review 的档案，不是这一轮的执行者，档位不低于执行者（设计“分派”的两条固定约束）。
-// 没有合适的返回 null：不验证，直接出审核卡。
+// 落账 done 回执时选验证者（P2-05）：kinds 有 review、档位不低于执行者的档案里，优先不同的 Agent；
+// 没有就用同一个 Agent（另一个档案优先，执行者自己的档案也行），验证者每次开新会话，不接执行者的会话（2026-11-12 人定）。
+// 同一档里按配置里的先后。没有合适的返回 null：不验证，直接出审核卡。
 export function chooseVerifier(cfg: Config, executor: string): string | null {
   const rank = { light: 0, strong: 1 } as const;
-  const need = rank[cfg.agents[executor]?.tier ?? "strong"];
-  for (const [name, p] of Object.entries(cfg.agents)) {
-    if (name !== executor && p.use !== cfg.agents[executor]?.use && p.kinds.includes("review") && rank[p.tier] >= need) return name;
-  }
-  return null;
+  const exec = cfg.agents[executor];
+  const need = rank[exec?.tier ?? "strong"];
+  const order = (name: string, use: string) => (use !== exec?.use ? 0 : name !== executor ? 1 : 2);
+  const ok = Object.entries(cfg.agents).filter(([, p]) => p.kinds.includes("review") && rank[p.tier] >= need)
+    .sort(([a, p], [b, q]) => order(a, p.use) - order(b, q.use));   // 稳定排序
+  return ok[0]?.[0] ?? null;
 }
 
 function depsSatisfied(db: DB, task: Task): boolean {
