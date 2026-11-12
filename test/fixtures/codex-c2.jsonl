@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a1d002-f67e-7191-9420-eedc9e9ea726"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Codex is ignoring 2 unrecognized configuration settings. Check for typos or deprecated settings.\n  user (/Users/me/.codex/config.toml): `mcp_servers.context7.type` is ignored.\n  user (/Users/me/.codex/config.toml): `mcp_servers.playwright.type` is ignored."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Codex is ignoring 2 unrecognized configuration settings. Check for typos or deprecated settings.\n  user (/Users/me/.codex/config.toml): `mcp_servers.context7.type` is ignored.\n  user (/Users/me/.codex/config.toml): `mcp_servers.playwright.type` is ignored."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"outcome\":\"done\",\"summary\":\"5\",\"handoff\":\"resumed\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":69491,"cached_input_tokens":41088,"cache_write_input_tokens":0,"output_tokens":124,"reasoning_output_tokens":0}}
