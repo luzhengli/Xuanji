@@ -20,7 +20,7 @@
   - **回执**：`codex exec --json -o <文件>` 跑一轮约 30 秒，`-o` 写出最后一条消息，即回执。事件流里 `thread.started.thread_id` 是会话编号，`turn.completed.usage` 是 token 用量。
   - **续接**：`codex exec resume <会话编号>` 接上原会话，会话编号不变，记得上文。续接不认 `-C`，用进程的当前目录，所以要把进程的 cwd 设成工作目录。
   - **只读沙箱**：`-s read-only -c approval_policy="never"` 下检查命令照常跑，写文件被拦（`operation not permitted`），工作区不变。可以做验证者。
-  - **用量**：事件流里没有，在会话文件的 `token_count.rate_limits` 里，见设计文档“尚待确认”。实测周用量 29%，11-18 重置。
+  - **用量**：事件流里没有，在会话文件的 `token_count.rate_limits` 里，见设计文档“尚待确认”。实测周用量 29%，11-18 重置。人说实际不止 29%（2026-11-12），这一项未确认，等人说明看的是哪里的数。
   - **接入注意**：
     - stdin 要关掉，否则 Codex 会等输入。
     - 用 `-c notify=[]` 关掉人配置里每轮结束时的桌面通知。
