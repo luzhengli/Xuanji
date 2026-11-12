@@ -318,7 +318,7 @@ export const handlers: Record<string, Handler> = {
       createCard(db, e, "decision", t.id, `验证 ${n} 轮没通过：${verdict!.summary}`,
         [`任务：${t.contract.objective}`, `最后一轮验证意见（${p.run_id}）：\n${verdict!.issues.map((i) => `- ${issueLine(i)}`).join("\n")}`,
           `残余风险：\n${verdict!.risks.map((r) => `- ${r}`).join("\n")}`,
-          `再给 ${MAX_VERIFY_ROUNDS} 轮：带着这次的意见接着改。按现状审核：出审核卡，你自己看。放弃：任务结束。`].join("\n"),
+          `再给 ${MAX_VERIFY_ROUNDS} 轮：带着这次的意见接着改。按现状审核：出审核卡，你自己看。放弃：任务结束。`].join("\n\n"),   // 列表前后空一行（飞书）
         VERIFY_OPTIONS, `verify:${t.id}`, "verify", 900);
       link(db, e.seq, t.id, `${p.run_id} 验证没通过，连续第 ${n} 轮，问人`);
       return;
@@ -739,7 +739,7 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
   // 验证过的（P2-05）：卡上写验证结论，残余风险原样列出；正文放宽，免得截掉人最该看的部分。没验证过的照旧。
   const v = verdictAfter(db, taskId, runId);
   const body = reviewBody(r, effectsOfTask(db, taskId), worktreesOf(db, taskId));
-  createCard(db, e, "review", taskId, `审核：${r.summary}`, v ? `${verdictBody(v.id, v.verdict)}\n${body}` : body,
+  createCard(db, e, "review", taskId, `审核：${r.summary}`, v ? `${verdictBody(v.id, v.verdict)}\n\n${body}` : body,
     [{ key: "accept", label: "接受", recommended: true }, { key: "return", label: "退回" }, { key: "takeover", label: "接管" }],
     `review:${taskId}:${runId}`, null, v ? 1500 : undefined);
 }
@@ -747,12 +747,12 @@ function reviewCard(db: DB, e: Event, taskId: string, runId: string): void {
 // 审核卡上的验证一段：结论、检查命令、问题（没通过、人选了按现状审核时才有）、残余风险。
 function verdictBody(runId: string, v: Verdict): string {
   const checks = (v.checks ?? []).map((c) => `\`${c.command}\` ${c.skipped ? "没跑" : c.ok ? "通过" : c.exit_code == null ? "没跑成" : `退出码 ${c.exit_code}`}`).join("；");
+  // 列表前后空一行：飞书的 markdown 不空行时，后面的文字会接到列表最后一项的末尾（2026-11-12 真实一轮 C-39 看到）。
   return [
-    `**验证** ${v.pass ? "通过" : "没通过"}（${runId}${v.reviewer ? `，${v.reviewer}` : ""}）：${v.summary}`,
-    checks && `检查命令：${checks}`,
+    [`**验证** ${v.pass ? "通过" : "没通过"}（${runId}${v.reviewer ? `，${v.reviewer}` : ""}）：${v.summary}`, checks && `检查命令：${checks}`].filter(Boolean).join("\n"),
     v.issues.length ? `问题：\n${v.issues.map((i) => `- ${issueLine(i)}`).join("\n")}` : "",
     `**残余风险**\n${v.risks.map((x) => `- ${x}`).join("\n")}`,
-  ].filter(Boolean).join("\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 // ---- 验证（P2-05）----

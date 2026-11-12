@@ -36,6 +36,14 @@ const verdict = (k: Kernel, run: string, task: string, pass: boolean, t = T0, ex
       : { verdict: "fail", summary: "half 算错了", issues: [{ criterion: "half(3) 返回 1.5", problem: "返回 1", where: "math.mjs:2" }], risks: RISKS },
     ...extra }, "worker", t);
 const cardsOf = (k: Kernel, task: string): Card[] => k.cards().filter((c) => c.about === task);
+// 飞书的 markdown：列表项后面紧跟的非列表文字会接到最后一项末尾，所以列表后面要空一行。
+function assertFeishuLists(body: string) {
+  const lines = body.split("\n");
+  lines.forEach((l, i) => {
+    const next = lines[i + 1];
+    if (l.startsWith("- ") && next !== undefined && next !== "" && !next.startsWith("- ")) assert.fail(`列表后没空行：${JSON.stringify(l)} → ${JSON.stringify(next)}`);
+  });
+}
 
 // ---- P2-04 Codex 适配器 ----
 
@@ -211,6 +219,7 @@ test("P2-05：done → 等验证（内核按配置写验证者，接单程序带
   assert.match(card!.body, /\*\*验证\*\* 通过（RN-2，codex）/);
   assert.match(card!.body, /`npm test` 通过/);
   assert.match(card!.body, /\*\*残余风险\*\*\n- 没有测负数/);
+  assertFeishuLists(card!.body);
   assert.equal(k.run(v.run_id)!.verdict!.pass, true);
 });
 
@@ -242,6 +251,7 @@ test("P2-05：没通过带着意见开下一轮（接上原会话，按在做的
   assert.equal(card!.options.find((o) => o.recommended)!.key, "review", "推荐按现状审核（人定）");
   assert.match(card!.body, /返回 1/);
   assert.match(card!.body, /没有测负数/);
+  assertFeishuLists(card!.body);
 
   // 按现状审核：出审核卡，卡上写没通过和问题。
   const k2 = new Kernel(cfg(), ":memory:");
@@ -253,6 +263,7 @@ test("P2-05：没通过带着意见开下一轮（接上原会话，按在做的
   const review = cardsOf(k2, "T-1")[0]!;
   assert.match(review.body, /\*\*验证\*\* 没通过/);
   assert.match(review.body, /问题：\n- ［half\(3\) 返回 1.5］返回 1/);
+  assertFeishuLists(review.body);
   assert.equal(k2.task("T-1")!.verify_due, null);
 
   // 再给 3 轮：轮数重新算，带着最后一次意见回队列。
@@ -458,6 +469,7 @@ test("P2-05：接单程序——检查命令过了才请验证者；验证者只
   const body = cardsOf(k, "T-1")[0]!.body;
   assert.match(body, /`npm test` 通过；`git push` 没跑/);
   assert.match(body, /- 没测负数\n- 检查命令 `git push` 没跑：命中禁用规则 git push/);
+  assertFeishuLists(body);
   assert.equal(k.overview().quota.find((q) => (q as { agent: string }).agent === "codex") !== undefined, true, "Codex 的用量也记账");
 });
 
