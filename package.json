@@ -2,6 +2,7 @@
   "name": "xuanji",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "璇玑：多 Agent 并行协调系统。一个确定性内核加一个 SQLite 文件。",
   "type": "module",
   "engines": { "node": ">=24" },
