@@ -259,8 +259,10 @@ test("P2-08：规划档案受 Claude 周用量管——读数按账号算（同�
   const s = k.overview().slots.find((x) => x.agent === "planner")!;
   assert.deepEqual([s.utilization, s.human_only, s.capacity], [0.85, true, 1]);
   const text = showStatus(k.overview() as unknown as Overview);
-  assert.match(text, /G-2 \[active\] 人提的（规划拆分中，或拆分计划等你确认）/);
-  assert.match(text, /规划 planner：1\/1 在跑，周用量过上限，只跑你亲自提的目标/);
+  assert.match(text, /在做\n  G-1 环境起的：规划拆分中，或拆分计划等你确认\n  G-2 人提的：规划拆分中，或拆分计划等你确认/);
+  assert.match(text, /规划 planner 1\/1，周用量过上限，只跑你亲自提的目标/);
+  // 额度按账号合并：claude、planner 是同一份订阅。
+  assert.match(text, /额度\n  Claude（claude、planner）：周 85%/);
   assert.doesNotMatch(text, /执行 planner/);
 });
 

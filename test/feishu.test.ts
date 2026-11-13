@@ -162,7 +162,12 @@ test("飞书一轮：一句话 → 主理人出目标卡并推来 → 确认立�
     assert.match(JSON.stringify(h.lark.updates[2]!.card), /结论\*\*：接受/);
 
     await h.say("/status");
-    assert.match(h.lark.texts.at(-1)!, /需要你：没有；另有 1 张知会卡[\s\S]*G-1 \[done\]/);
+    // /status 回一张分段的卡片（2026-11-13 改）：每段一个元素，状态用中文。
+    const status = h.lark.cards.at(-1)!.card as { header: { title: { content: string } }; body: { elements: { content: string }[] } };
+    assert.equal(status.header.title.content, "状态");
+    assert.deepEqual(status.body.elements.map((e) => e.content.split("\n")[0]), ["**需要你**", "**在做**", "**最近结束**", "**名额（在跑/上限）**"]);
+    assert.equal(status.body.elements[0]!.content, "**需要你**\n- 没有\n- 知会 1 张，不用动作");
+    assert.match(status.body.elements[2]!.content, /- G-1 完成：/);
   } finally { await h.close(); }
 });
 
@@ -236,7 +241,7 @@ test("真实消息：私聊文字的 content 是纯文本；说目标、/card、
     assert.ok(goals[0]!.title.startsWith("在 math.mjs 新增并导出函数 div(a, b)") && goals[1]!.title.startsWith("在 math.mjs 新增并导出 greet2(name)"));
     assert.deepEqual(goals.map((g) => g.status), ["proposed", "proposed"], "交给主理人整理，等人确认");
     assert.match(h.lark.texts[0]!, /^收到（G-1）/);
-    assert.equal(h.lark.texts.length, 5, "每条消息只回一次");
+    assert.equal(h.lark.texts.length + h.lark.cards.length, 5, "每条消息只回一次（/status 回的是卡片）");
   } finally { await h.close(); }
 });
 

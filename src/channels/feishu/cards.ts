@@ -109,3 +109,12 @@ export function renderRulings(rulings: Ruling[], note = ""): Record<string, unkn
     body: { elements },
   };
 }
+
+// /status（2026-11-13 改成卡片）：分段的全局状态，不进注意力队列，没有按钮。
+export function renderStatus(markdown: string, at: string): Record<string, unknown> {
+  return {
+    schema: "2.0", config: { update_multi: true, width_mode: "default" },
+    header: { title: { tag: "plain_text", content: "状态" }, subtitle: { tag: "plain_text", content: at }, template: "grey" },
+    body: { elements: bodyElements(markdown) },
+  };
+}

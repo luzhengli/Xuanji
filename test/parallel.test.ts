@@ -80,7 +80,7 @@ test("P2-01：周用量过 60% 执行降为 1 个、领活结果带 subagents: f
   assert.equal(c.subagents, false);
   receipt(k2, c.run_id, c.task.id, "done");
   assert.equal(claim(k2), null, "只剩环境触发的，不派");
-  assert.match(showStatus(k2.overview() as unknown as Overview), /执行 claude：0\/1 在跑，周用量过上限，只跑你亲自提的目标/);
+  assert.match(showStatus(k2.overview() as unknown as Overview), /执行 claude 0\/1，周用量过上限，只跑你亲自提的目标/);
 });
 
 // ---- P2-06 背压 ----

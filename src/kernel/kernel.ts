@@ -188,7 +188,15 @@ export class Kernel {
       // 规划（P2-08）：kinds 有 plan 的档案，单列规划的名额。
       ...(this.cfg.agents[agent]!.kinds.includes("plan") ? { planning: (this.db.prepare(`SELECT COUNT(*) AS n FROM judgments WHERE agent = ? AND status = 'running' AND kind = 'plan'`).get(agent) as { n: number }).n } : {}),
       executes: this.cfg.agents[agent]!.kinds.includes("code") }));
-    return { goals, tasks, runs, cards: this.cards(), quota, backup: this.backups(), backpressure, slots };
+    // 额度按账号（2026-11-13）：同一个 Agent 的几个档案共用一份订阅，取最近的一次读数，和调度用的一样。
+    const rows = quota as { agent: string; seven_day_utilization: number | null; seven_day_resets_at: string | null; five_hour_utilization: number | null; five_hour_resets_at: string | null; observed_at: string | null }[];
+    const accounts = [...new Set(Object.values(this.cfg.agents).map((p) => p.use))].map((use) => {
+      const names = Object.entries(this.cfg.agents).filter(([, p]) => p.use === use).map(([n]) => n);
+      const r = rows.filter((x) => names.includes(x.agent)).sort((a, b) => (a.observed_at ?? "").localeCompare(b.observed_at ?? "")).at(-1);
+      return { use, agents: names, seven_day: r?.seven_day_utilization ?? null, seven_day_resets_at: r?.seven_day_resets_at ? Number(r.seven_day_resets_at) : null,
+        five_hour: r?.five_hour_utilization ?? null, five_hour_resets_at: r?.five_hour_resets_at ? Number(r.five_hour_resets_at) : null };
+    });
+    return { goals, tasks, runs, cards: this.cards(), quota, accounts, backup: this.backups(), backpressure, slots };
   }
 
   close() { this.db.close(); }

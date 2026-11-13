@@ -81,7 +81,7 @@ test("验收 1：xj goal → 接单程序跑一轮 → 回执入账 → 审核�
     const o = await h.xjJson<Overview>("status");
     assert.equal(o.tasks[0]!.state, "done");
     assert.equal(o.goals[0]!.status, "done");
-    assert.match(await h.xj("status"), /G-1 \[done\][\s\S]*T-1 \[done\]/);
+    assert.match(await h.xj("status"), /最近结束\n  G-1 完成：/);
   } finally { await h.close(); }
 });
 

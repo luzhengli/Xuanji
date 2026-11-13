@@ -32,7 +32,7 @@ const USAGE = `用法：
   xj goal --direct "<一句话>" [--check "<命令>"]... [--split]
                                 跳过主理人直接立项；--check 写检查命令，做完后在任务的 worktree 里跑；
                                 --split 先由规划切成几个任务，拆分计划出卡给你确认
-  xj status                     目标、任务按“在等谁”分组，卡片队列，额度读数
+  xj status [--all]             需要你、在做、最近结束（--all 列全部）、名额、额度、备份
   xj cards                      待处理卡片
   xj answer <C-x> <选项> [说明] [--scope task|goal|project|global]
   xj stop <T-x>                 停一个任务
@@ -100,7 +100,7 @@ switch (cmd) {
     print(card ?? r, () => (card ? showCard(card) : "没出简报"));
     break;
   }
-  case "status": { const o = await get("/overview") as Overview; print(o, () => showStatus(o, { cardsHint: "xj cards" })); break; }
+  case "status": { const o = await get("/overview") as Overview; print(o, () => showStatus(o, { cardsHint: "xj cards", doneLimit: showAll ? undefined : 5 })); break; }
   case "cards": { const c = await get("/cards") as Card[]; print(c, () => c.map(showCard).join("\n\n") || "没有待处理的卡片"); break; }
   case "answer": {
     const [card, choice, ...note] = rest;

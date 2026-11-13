@@ -7,9 +7,9 @@ import { promisify } from "node:util";
 import { createInterface } from "node:readline";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { renderCard, renderAnswered, parseButtonName, parseRevokeName, renderRulings, SCOPES } from "./cards.ts";
+import { renderCard, renderAnswered, parseButtonName, parseRevokeName, renderRulings, renderStatus, SCOPES } from "./cards.ts";
 import { route, HELP } from "./commands.ts";
-import { showStatus, splitCards, type Overview } from "../format.ts";
+import { statusMarkdown, splitCards, type Overview } from "../format.ts";
 import { localDate } from "../../sources/timer.ts";
 import { retryConn } from "../../shared/retry.ts";
 import type { Card, Ruling, RulingScope } from "../../kernel/types.ts";
@@ -161,7 +161,9 @@ export class FeishuChannel {
       }
       case "status": {
         const o = await this.deps.kernel.get<Overview>("/overview");
-        await this.deps.lark.sendText(showStatus(o, { cardsHint: "发 /card 查看", doneLimit: 3 }), idem("r", mid));
+        const now = new Date();
+        await this.deps.lark.sendCard(renderStatus(statusMarkdown(o, { cardsHint: "发 /card 取", doneLimit: 3, now }),
+          `${now.getMonth() + 1} 月 ${now.getDate()} 日 ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`), idem("r", mid));
         return;
       }
       case "unknown": await this.deps.lark.sendText(`不认识的命令 ${r.command}。\n\n${HELP}`, idem("r", mid)); return;
